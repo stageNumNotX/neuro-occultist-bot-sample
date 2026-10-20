@@ -171,7 +171,7 @@ There is **no** shared transaction between Telegram and the store. Exactly-once 
 - After Telegram accepts a send, the bot writes one delivery record per RSS link for that chat. If a write fails, `Broadcast` returns an error (`ErrStateSave`). It does **not** report full success. The next run may still send that chat again, because the missing records look like “not delivered”. Returning the error does not remove that duplicate window.
 - A multi-link batch can be **partially** saved (first link written, later link failed). That chat is not treated as complete.
 - While a frozen digest is open, a new headline `Y` does not get merged into a retry of `X`. Recipients who already received `X` are skipped; `Y` becomes a later batch.
-- The frozen batch completes when every **active** chat has those links. A chat that left, kicked the bot, or returns a permanent Telegram error (kicked/blocked/not a member/chat not found) is removed from the recipient list. That chat is **not** marked delivered. Temporary send errors stay retryable.
+- The frozen batch completes when every **active** chat has those links. A chat that left, kicked the bot, or returns a permanent Telegram error (kicked/blocked/not a member/chat not found) is removed from the recipient list. That chat is **not** marked delivered. If `RemoveChat` fails, `Broadcast` returns an error (`ErrRecipientDrop`) instead of success so the next run can retry the drop. Temporary send errors stay retryable.
 - `FetchUnsent` treats a link as “done” only when **every active** chat has it. Per-chat skipping at send time uses `chatHasAll` on the frozen link set.
 
 ## Telegram commands

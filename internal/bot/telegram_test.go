@@ -342,10 +342,11 @@ func TestStop_withoutStartReturns(t *testing.T) {
 
 type markHookStore struct {
 	storage.Store
-	failLink string
-	failChat int64
-	failN    int
-	n        int
+	failLink  string
+	failChat  int64
+	failN     int
+	n         int
+	removeErr error
 }
 
 func (s *markHookStore) MarkDelivered(ctx context.Context, chatID int64, link string) error {
@@ -360,6 +361,13 @@ func (s *markHookStore) MarkDelivered(ctx context.Context, chatID int64, link st
 		return errors.New("mark failed")
 	}
 	return s.Store.MarkDelivered(ctx, chatID, link)
+}
+
+func (s *markHookStore) RemoveChat(ctx context.Context, chatID int64) error {
+	if s.removeErr != nil {
+		return s.removeErr
+	}
+	return s.Store.RemoveChat(ctx, chatID)
 }
 
 func TestBroadcast_markFailureIsNotSuccess(t *testing.T) {
@@ -574,6 +582,71 @@ func TestBroadcast_permanentKickUnblocksNewDigest(t *testing.T) {
 	}
 	if len(toA) != 2 || toA[0] != "DIGEST-X" || toA[1] != "DIGEST-Y" {
 		t.Fatalf("chat A content=%v", toA)
+	}
+}
+
+func TestBroadcast_removeChatFailureIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+	store := &markHookStore{Store: mem, removeErr: errors.New("firestore down")}
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(store, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+	api := &telegramAPI{goneFor: map[string]bool{"2": true}}
+	b := testBot(t, store, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = b.Broadcast(ctx, d1.Post, nil, d1.Links)
+	if !errors.Is(err, ErrRecipientDrop) {
+		t.Fatalf("failed RemoveChat must not look like success, err=%v", err)
+	}
+
+	chats, err := mem.ListChats(ctx)
+	if err != nil || len(chats) != 2 {
+		t.Fatalf("B must stay active after failed drop, chats=%v err=%v", chats, err)
+	}
+	wasB, _ := mem.WasDelivered(ctx, 2, "https://example.com/x")
+	if wasB {
+		t.Fatal("failed drop must not write a fake delivery")
+	}
+
+	dFrozen, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dFrozen.Post != "DIGEST-X" {
+		t.Fatalf("pending X must stay open while B is still listed, got %q", dFrozen.Post)
+	}
+
+	store.removeErr = nil
+	if err := b.Broadcast(ctx, dFrozen.Post, nil, dFrozen.Links); err != nil {
+		t.Fatalf("retry drop: %v", err)
+	}
+	chats, err = mem.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("retry must remove B, chats=%v err=%v", chats, err)
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-Y" {
+		t.Fatalf("after successful drop, next digest must be Y, got %q", d2.Post)
 	}
 }
 

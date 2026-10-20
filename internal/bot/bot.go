@@ -35,6 +35,9 @@ var (
 	// ErrStateSave means Telegram accepted one or more messages but delivery
 	// state was not fully persisted. The next run may send those chats again.
 	ErrStateSave = errors.New("broadcast sent but delivery state was not fully saved")
+	// ErrRecipientDrop means a chat is permanently unavailable but could not
+	// be removed from the active recipient list.
+	ErrRecipientDrop = errors.New("broadcast could not remove an unavailable recipient")
 )
 
 // Options wires Telegram, storage, the RSS/LLM pipeline, and optional images.
@@ -349,7 +352,7 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 		return ErrNoChats
 	}
 
-	var sent, saved, unsaved, failed, skipped int
+	var sent, saved, unsaved, failed, skipped, dropFailed int
 	var firstErr error
 	for _, ch := range chats {
 		if err := ctx.Err(); err != nil {
@@ -366,7 +369,12 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 		if err := b.sendOne(chat, post, img); err != nil {
 			log.Printf("send to chat %d failed: %v", ch.ID, err)
 			if isPermanentUnavailable(err) {
-				b.dropRecipient(ctx, ch.ID, err)
+				if dropErr := b.dropRecipient(ctx, ch.ID, err); dropErr != nil {
+					dropFailed++
+					if firstErr == nil {
+						firstErr = dropErr
+					}
+				}
 				continue
 			}
 			failed++
@@ -388,24 +396,28 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 	}
 
 	switch {
-	case sent == 0 && failed > 0 && skipped == 0:
+	case sent == 0 && failed > 0 && skipped == 0 && dropFailed == 0:
 		return fmt.Errorf("%w: %v", ErrAllFailed, firstErr)
 	case failed > 0 && unsaved > 0:
-		return fmt.Errorf("%w: %w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d: %v", ErrPartial, ErrStateSave, sent, saved, unsaved, failed, skipped, firstErr)
+		return fmt.Errorf("%w: %w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d dropFailed=%d: %v", ErrPartial, ErrStateSave, sent, saved, unsaved, failed, skipped, dropFailed, firstErr)
 	case failed > 0:
-		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d", ErrPartial, sent, saved, unsaved, failed, skipped)
+		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d dropFailed=%d", ErrPartial, sent, saved, unsaved, failed, skipped, dropFailed)
 	case unsaved > 0:
-		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d skipped=%d: %v", ErrStateSave, sent, saved, unsaved, skipped, firstErr)
+		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d skipped=%d dropFailed=%d: %v", ErrStateSave, sent, saved, unsaved, skipped, dropFailed, firstErr)
+	case dropFailed > 0:
+		return fmt.Errorf("%w: %v", ErrRecipientDrop, firstErr)
 	default:
 		return nil
 	}
 }
 
-func (b *Bot) dropRecipient(ctx context.Context, chatID int64, reason error) {
+func (b *Bot) dropRecipient(ctx context.Context, chatID int64, reason error) error {
 	log.Printf("dropping inactive chat %d: %v", chatID, reason)
 	if err := b.store.RemoveChat(ctx, chatID); err != nil {
 		log.Printf("remove chat %d: %v", chatID, err)
+		return err
 	}
+	return nil
 }
 
 func isPermanentUnavailable(err error) bool {
