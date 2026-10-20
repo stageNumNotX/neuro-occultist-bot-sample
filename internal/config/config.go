@@ -68,7 +68,7 @@ func Load() (AppConfig, error) {
 			os.Getenv("GEMINI_API_KEY"),
 			os.Getenv("GOOGLE_API_KEY"),
 		),
-		GeminiModel:    getenvDefault("GEMINI_MODEL", "gemini-3.5-flash"),
+		GeminiModel:    getenvDefault("GEMINI_MODEL", "gemini-3.8-flash"),
 		DigestLanguage: normalizeLanguage(os.Getenv("DIGEST_LANGUAGE")),
 		AdminUserIDs:   parseIDSet(os.Getenv("ADMIN_USER_IDS")),
 		VertexAI: VertexAI{

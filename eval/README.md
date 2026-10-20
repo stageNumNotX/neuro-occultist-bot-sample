@@ -17,6 +17,6 @@ Unit tests assert prompt wrapping, truncation, and empty-input errors. They do *
 
 ## Measurements
 
-Live GCP usage and eval numbers are being collected separately. They are **not in this directory**: no model id, date, example count, latency, tokens, or cost.
+Operational Cloud Run numbers live in the root README (Production usage). This directory still has **no token counts, latency of ComposePost, or cost**.
 
-`go test` only checks that `BuildPrompt` wraps and caps the fixtures. Keep any later live notes out of the unit-test log; a green suite is not an eval score.
+`go test` only checks that `BuildPrompt` wraps and caps the fixtures. A green suite is not an eval score.

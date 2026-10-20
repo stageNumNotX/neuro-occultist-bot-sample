@@ -15,6 +15,7 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	t.Setenv("RSS_FEEDS", "")
 	t.Setenv("FEEDS", "")
 	t.Setenv("ADMIN_USER_IDS", "42, 99")
+	t.Setenv("GEMINI_MODEL", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -37,6 +38,9 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	}
 	if cfg.DigestLanguage != "Russian" {
 		t.Fatalf("default digest language=%q", cfg.DigestLanguage)
+	}
+	if cfg.GeminiModel != "gemini-3.8-flash" {
+		t.Fatalf("default gemini model=%q", cfg.GeminiModel)
 	}
 }
 

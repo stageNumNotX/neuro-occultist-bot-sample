@@ -55,6 +55,28 @@ The headlines and post below are a **hand-written fixture** so a reviewer can se
 
 The live binary still needs real `TELEGRAM_TOKEN` and `GEMINI_API_KEY`. Contributors can exercise the code without keys via `make test` (mocked LLM and Telegram).
 
+## Production usage
+
+This is a **low-traffic personal experiment**, not a high-scale service. Figures below are as of **2026-10-20**. Measured and estimated are listed separately. Token counts and dollar cost are unavailable (no Gemini token metrics, no billing export).
+
+### Measured
+
+Sources are in parentheses.
+
+- **Where it runs.** Cloud Run `us-central1` since 13 Aug 2025 (`creationTimestamp`). 1 vCPU, 512Mi, concurrency 80, max 3 instances. Observed max instances = 1 (Cloud Monitoring, 6 weeks).
+- **HTTP.** 8 Sep–20 Oct 2026: 1,016 requests (1,015 2xx, 1 5xx), typically ~24/day = hourly Cloud Scheduler (Monitoring `request_count`). For `/broadcast`, daily p50 latency median ~1.05 s, daily p95 latency median ~2.2 s (`request_latencies`).
+- **Broadcast outcomes.** Last ~30 days: ~539 scheduler runs logged a successful broadcast; 182 returned 204 no new items (Cloud Logging).
+- **Channel and store.** Public channel [t.me/Neuro_Occultist](https://t.me/Neuro_Occultist): 3 subscribers. Firestore: 5 chat docs, 12,956 delivery-record docs.
+- **Gemini outage, then fix.** From roughly Sep to 20 Oct 2026 Gemini calls failed (`gemini-1.5-flash` retired; `gemini-2.5-flash` returned 404 “no longer available to new users” for this key). Production fell back to non-LLM text. On 2026-10-20 the model was switched to `gemini-3.8-flash` and verified with a real broadcast (Gemini-generated post, ~61 s end-to-end for 5 chats including image attempts). This sample’s default is that model; override with `GEMINI_MODEL`.
+- **Images.** Vertex `imagegeneration@006` currently returns 404; posts go out without images. This sample still treats Imagen as optional and sends text if image generation fails.
+
+This sample does **not** implement the production non-LLM text fallback. A failed Gemini call returns an error and does not mark RSS items as posted.
+
+### Estimated (not measured)
+
+- Webhook handler benchmark ~1.4 µs/op locally with stubs (a ceiling, not production latency).
+- Cloud Run allows 240 in-flight requests, but digest fan-out is bounded by Telegram limits as implemented (~30 msg/s global, ~1 msg/s per chat), so one digest realistically reaches hundreds of chats inside the 300 s Cloud Run timeout, not thousands. With a working LLM, model latency and RPM dominate.
+
 ## Project layout
 
 | Path | Role |
@@ -135,7 +157,7 @@ Unit tests mock the LLM (`ComposePost`), intercept Telegram Bot API calls with a
 | `WEBHOOK_SECRET` | webhook mode | Shared secret for Telegram webhook verification |
 | `BROADCAST_SECRET` | no | If set, `POST /broadcast` requires `X-Broadcast-Secret` (or `X-Cron-Token`). If unset, the route is 404 |
 | `ADMIN_USER_IDS` | no | Comma-separated Telegram user IDs for `/status` and `/chats` |
-| `GEMINI_MODEL` | no | Default `gemini-3.5-flash` |
+| `GEMINI_MODEL` | no | Gemini model id. Default `gemini-3.8-flash` (production id as of 2026-10-20) |
 | `RSS_FEEDS` | no | Comma-separated feed URLs (`FEEDS` also accepted) |
 | `FIRESTORE_PROJECT_ID` | no | GCP project for persistence (`GOOGLE_CLOUD_PROJECT` also accepted) |
 | `FIRESTORE_DATABASE` | no | Firestore database id, default `(default)` |
@@ -194,7 +216,7 @@ There is **no** per-user quota on `/rss_summary`, `/vision`, or `/news_vision`. 
 
 `go test ./internal/llm` checks prompt construction against that file. That is not a quality score.
 
-Live GCP usage and eval numbers are being collected separately and are **not in this repository**. This revision does not record model id, example count, latency, tokens, or cost.
+Operational Cloud Run / Scheduler / Logging numbers are in [Production usage](#production-usage). Token counts and cost are still unavailable. `go test` is not an eval score.
 
 ## Deploy (Cloud Run)
 
@@ -237,6 +259,7 @@ Observable in the code (not a biography):
 - **Restricted / muted chats are not auto-dropped.** Only leave/kick member updates and a small set of permanent Telegram API errors remove a recipient. A 403 that is not kick/block still retries.
 - **Public generation commands are uncapped.** `/rss_summary`, `/vision`, and `/news_vision` have timeouts but no spend quota.
 - **In-memory mode loses state on restart** (chats, delivery records, frozen digest). If Firestore is configured but the client cannot be created, the process currently falls back to memory and logs that fact.
+- **Failed LLM generation does not mark RSS items as posted.** `BuildDigest` returns an error before a pending digest is saved and before Telegram send. `/broadcast` is then 500 and `Broadcast` is not called. This sample has no non-LLM text fallback (production briefly did, Sep–20 Oct 2026; see Production usage).
 - **No Gemini retries or token budget** beyond prompt caps (8 items, 400 runes/item) and a 45s LLM timeout.
 - **RSS merge is not date-sorted**; a single failing feed is skipped.
 - **Firestore and live Vertex HTTP are not unit-tested** (no emulator in CI).

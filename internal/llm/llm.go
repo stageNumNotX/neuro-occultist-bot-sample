@@ -45,7 +45,7 @@ func newClient(ctx context.Context, apiKey, modelName, language string, httpClie
 		return nil, fmt.Errorf("gemini api key is required")
 	}
 	if modelName == "" {
-		modelName = "gemini-3.5-flash"
+		modelName = "gemini-3.8-flash"
 	}
 	language = strings.TrimSpace(language)
 	if language == "" {

@@ -151,12 +151,26 @@ func TestBuildDigest_usesComposer(t *testing.T) {
 }
 
 func TestBuildDigest_composerError(t *testing.T) {
-	a := NewAgent(storage.NewMemory(), nil, &fakeComposer{err: errors.New("boom")})
-	a.fetch = func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
-		return []rss.Item{{Title: "H", Link: "https://example.com/h"}}, nil
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 1, Title: "A"}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := a.BuildDigest(context.Background(), 3); err == nil {
+	link := "https://example.com/h"
+	a := NewAgent(mem, nil, &fakeComposer{err: errors.New("boom")})
+	a.fetch = func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		return []rss.Item{{Title: "H", Link: link}}, nil
+	}
+	if _, err := a.BuildDigest(ctx, 3); err == nil {
 		t.Fatal("expected error")
+	}
+	was, err := mem.WasDelivered(ctx, 1, link)
+	if err != nil || was {
+		t.Fatalf("LLM failure must not mark RSS items posted, was=%v err=%v", was, err)
+	}
+	pending, err := mem.GetPendingDigest(ctx)
+	if err != nil || pending != nil {
+		t.Fatalf("LLM failure must not freeze a digest, pending=%v err=%v", pending, err)
 	}
 }
 
