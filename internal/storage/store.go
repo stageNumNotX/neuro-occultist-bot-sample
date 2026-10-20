@@ -32,7 +32,7 @@ type Delivery struct {
 }
 
 // PendingDigest is a frozen broadcast batch. New RSS items wait until every
-// saved chat has every link in this batch. There is no Telegram/store transaction.
+// active saved chat has every link in this batch. There is no Telegram/store transaction.
 type PendingDigest struct {
 	Post  string   `json:"post" firestore:"post"`
 	Links []string `json:"links" firestore:"links"`
@@ -40,8 +40,10 @@ type PendingDigest struct {
 }
 
 // Store persists chats, per-chat delivery of RSS links, and the frozen digest.
+// ListChats is the active recipient set used for broadcast and pending completion.
 type Store interface {
 	SaveChat(ctx context.Context, chat Chat) error
+	RemoveChat(ctx context.Context, chatID int64) error
 	ListChats(ctx context.Context) ([]Chat, error)
 	MarkDelivered(ctx context.Context, chatID int64, link string) error
 	WasDelivered(ctx context.Context, chatID int64, link string) (bool, error)

@@ -171,7 +171,8 @@ There is **no** shared transaction between Telegram and the store. Exactly-once 
 - After Telegram accepts a send, the bot writes one delivery record per RSS link for that chat. If a write fails, `Broadcast` returns an error (`ErrStateSave`). It does **not** report full success. The next run may still send that chat again, because the missing records look like “not delivered”. Returning the error does not remove that duplicate window.
 - A multi-link batch can be **partially** saved (first link written, later link failed). That chat is not treated as complete.
 - While a frozen digest is open, a new headline `Y` does not get merged into a retry of `X`. Recipients who already received `X` are skipped; `Y` becomes a later batch.
-- `FetchUnsent` still treats a link as “done” only when **every** saved chat has it. Per-chat skipping at send time uses `chatHasAll` on the frozen link set.
+- The frozen batch completes when every **active** chat has those links. A chat that left, kicked the bot, or returns a permanent Telegram error (kicked/blocked/not a member/chat not found) is removed from the recipient list. That chat is **not** marked delivered. Temporary send errors stay retryable.
+- `FetchUnsent` treats a link as “done” only when **every active** chat has it. Per-chat skipping at send time uses `chatHasAll` on the frozen link set.
 
 ## Telegram commands
 
@@ -222,7 +223,7 @@ Hardening for the public sample (delivery retries, docs, eval fixtures) was done
 Observable in the code (not a biography):
 
 - **Fixed pipeline, not an agent.** One RSS fetch, at most one Gemini completion per new batch, optional Imagen, then send. No tool calling, planner, or multi-step loop — cheaper and easier to test than an autonomous agent, and it matches what the binary does.
-- **Frozen digest for retries.** Partial Telegram failure plus a new RSS item used to resend `X` to a chat that already got `X`. The pending batch keeps the composed post and link set until every saved chat has those links.
+- **Frozen digest for retries.** Partial Telegram failure plus a new RSS item used to resend `X` to a chat that already got `X`. The pending batch keeps the composed post and link set until every **active** chat has those links. Dead recipients are dropped so they cannot stall new posts for everyone else.
 - **Per-chat delivery hashes.** Success is recorded per `(chat, link)` so a failed recipient can be retried without a Telegram/store transaction.
 - **System instruction vs user data.** Style/security sit in `SystemInstruction`; headlines are sanitized and wrapped. Defense in depth, not a proof of injection resistance.
 - **Interfaces + `httptest`.** `llm.Composer`, `image.Generator`, and `storage.Store` let CI run without Gemini, Telegram, or Firestore.
@@ -233,6 +234,7 @@ Observable in the code (not a biography):
 - **Duplicates after a save failure.** Telegram can accept a message while `MarkDelivered` fails. The error is returned; the next broadcast may send that chat again. If only some links in a batch are saved, the chat is not complete and the **whole frozen post** may be sent again (this sample does not rewrite a partial link set).
 - **Store read errors look like “not delivered”.** A failed `WasDelivered` lookup skips the “already sent” check, so a transient read error can cause a resend.
 - **Concurrent broadcasts / multiple instances.** Two overlapping `/broadcast` runs can compose or send the same batch. There is no leader election or lease. The frozen batch stores post and links, not a snapshot of recipients: a chat added mid-retry receives the frozen post.
+- **Restricted / muted chats are not auto-dropped.** Only leave/kick member updates and a small set of permanent Telegram API errors remove a recipient. A 403 that is not kick/block still retries.
 - **Public generation commands are uncapped.** `/rss_summary`, `/vision`, and `/news_vision` have timeouts but no spend quota.
 - **In-memory mode loses state on restart** (chats, delivery records, frozen digest). If Firestore is configured but the client cannot be created, the process currently falls back to memory and logs that fact.
 - **No Gemini retries or token budget** beyond prompt caps (8 items, 400 runes/item) and a 45s LLM timeout.

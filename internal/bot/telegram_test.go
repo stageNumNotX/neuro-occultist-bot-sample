@@ -47,8 +47,9 @@ type recordedSend struct {
 type telegramAPI struct {
 	mu      sync.Mutex
 	sends   []recordedSend
-	failFor map[string]bool
-	failNth map[int]bool
+	failFor map[string]bool // temporary (5xx); recipient stays active
+	goneFor map[string]bool // permanent kick/block; recipient must be dropped
+	failNth map[int]bool    // temporary
 	n       int
 }
 
@@ -58,14 +59,18 @@ func (a *telegramAPI) roundTrip(req *http.Request) (*http.Response, error) {
 	a.mu.Lock()
 	a.n++
 	n := a.n
-	fail := a.failFor[chatID] || a.failNth[n]
+	gone := a.goneFor[chatID]
+	fail := !gone && (a.failFor[chatID] || a.failNth[n])
 	if method == "sendMessage" || method == "sendPhoto" {
-		a.sends = append(a.sends, recordedSend{Method: method, ChatID: chatID, Text: text, OK: !fail})
+		a.sends = append(a.sends, recordedSend{Method: method, ChatID: chatID, Text: text, OK: !gone && !fail})
 	}
 	a.mu.Unlock()
 
+	if gone {
+		return jsonResponse(http.StatusForbidden, `{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked from the channel chat"}`)
+	}
 	if fail {
-		return jsonResponse(http.StatusForbidden, `{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked"}`)
+		return jsonResponse(http.StatusInternalServerError, `{"ok":false,"error_code":500,"description":"Internal Server Error"}`)
 	}
 	body := `{"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":1,"type":"channel"}}}`
 	if method == "sendPhoto" {
@@ -509,6 +514,120 @@ func TestBroadcast_rssChangeDoesNotResendToSuccess(t *testing.T) {
 	}
 	if xCount != 1 {
 		t.Fatalf("chat A must not receive X again after Y appeared, messages=%v", toA)
+	}
+}
+
+func TestBroadcast_permanentKickUnblocksNewDigest(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(mem, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+
+	api := &telegramAPI{goneFor: map[string]bool{"2": true}}
+	b := testBot(t, mem, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Broadcast(ctx, d1.Post, nil, d1.Links); err != nil {
+		t.Fatalf("first broadcast: %v", err)
+	}
+
+	chats, err := mem.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("kicked chat must be removed, chats=%v err=%v", chats, err)
+	}
+	wasB, _ := mem.WasDelivered(ctx, 2, "https://example.com/x")
+	if wasB {
+		t.Fatal("kicked chat must not be marked delivered")
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-Y" {
+		t.Fatalf("after dropping B, next digest must be Y, got %q", d2.Post)
+	}
+	if err := b.Broadcast(ctx, d2.Post, nil, d2.Links); err != nil {
+		t.Fatal(err)
+	}
+
+	var toA []string
+	for _, s := range api.snapshot() {
+		if s.OK && s.ChatID == "1" {
+			toA = append(toA, s.Text)
+		}
+	}
+	if len(toA) != 2 || toA[0] != "DIGEST-X" || toA[1] != "DIGEST-Y" {
+		t.Fatalf("chat A content=%v", toA)
+	}
+}
+
+func TestMyChatMember_kickedUnblocksPending(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(mem, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+	api := &telegramAPI{failFor: map[string]bool{"2": true}}
+	b := testBot(t, mem, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = b.Broadcast(ctx, d1.Post, nil, d1.Links)
+	if !errors.Is(err, ErrPartial) {
+		t.Fatalf("temporary fail should stay retryable, err=%v", err)
+	}
+
+	b.ProcessUpdate(tb.Update{
+		MyChatMember: &tb.ChatMemberUpdate{
+			Chat:          &tb.Chat{ID: 2, Title: "B", Type: tb.ChatChannel},
+			NewChatMember: &tb.ChatMember{Role: tb.Kicked, User: &tb.User{ID: 0}},
+		},
+	})
+
+	chats, err := mem.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("leave/kick must remove B, chats=%v err=%v", chats, err)
+	}
+	wasB, _ := mem.WasDelivered(ctx, 2, d1.Links[0])
+	if wasB {
+		t.Fatal("kick must not write a fake delivery")
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-Y" {
+		t.Fatalf("removing B via my_chat_member must release the batch, got %q", d2.Post)
 	}
 }
 

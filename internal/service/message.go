@@ -48,9 +48,9 @@ type Digest struct {
 	Post  string
 }
 
-// BuildDigest returns the frozen pending batch if any saved chat still lacks
-// those links. Otherwise it fetches items not yet delivered to every saved chat
-// and composes one post, then stores that batch so a later RSS item cannot
+// BuildDigest returns the frozen pending batch if any active chat still lacks
+// those links. Otherwise it fetches items not yet delivered to every active
+// chat and composes one post, then stores that batch so a later RSS item cannot
 // merge into a retry and resend already-delivered headlines.
 func (a *Agent) BuildDigest(ctx context.Context, maxItems int) (Digest, error) {
 	if a.store != nil {
@@ -173,7 +173,8 @@ func (a *Agent) pendingComplete(ctx context.Context, links []string) (bool, erro
 		return false, fmt.Errorf("list chats: %w", err)
 	}
 	if len(chats) == 0 {
-		return false, nil
+		// No active recipients left: do not wait on chats that were removed.
+		return true, nil
 	}
 	for _, link := range links {
 		if !a.deliveredToAll(ctx, chats, link) {

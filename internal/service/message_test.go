@@ -239,6 +239,51 @@ func TestBuildDigest_reusesPendingWhenRSSGrows(t *testing.T) {
 	}
 }
 
+func TestBuildDigest_removeChatUnblocksPending(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 1, Title: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 2, Title: "B"}); err != nil {
+		t.Fatal(err)
+	}
+	fc := &fakeComposer{post: "post-X"}
+	items := []rss.Item{{Title: "X", Link: "https://example.com/x"}}
+	a := NewAgent(mem, nil, fc)
+	a.fetch = func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		return items, nil
+	}
+
+	if _, err := a.BuildDigest(ctx, 6); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.MarkDelivered(ctx, 1, "https://example.com/x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.RemoveChat(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	wasB, err := mem.WasDelivered(ctx, 2, "https://example.com/x")
+	if err != nil || wasB {
+		t.Fatalf("removed chat must not get a fake delivery, was=%v err=%v", wasB, err)
+	}
+
+	items = []rss.Item{
+		{Title: "X", Link: "https://example.com/x"},
+		{Title: "Y", Link: "https://example.com/y"},
+	}
+	fc.post = "post-Y"
+	d, err := a.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Post != "post-Y" || len(d.Links) != 1 || d.Links[0] != "https://example.com/y" {
+		t.Fatalf("removing B must complete X for remaining chats, got %+v", d)
+	}
+}
+
 func TestBuildLatestDigest_ignoresPending(t *testing.T) {
 	ctx := context.Background()
 	mem := storage.NewMemory()

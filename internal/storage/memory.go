@@ -30,6 +30,13 @@ func (m *Memory) SaveChat(_ context.Context, chat Chat) error {
 	return nil
 }
 
+func (m *Memory) RemoveChat(_ context.Context, chatID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.chats, chatID)
+	return nil
+}
+
 func (m *Memory) ListChats(_ context.Context) ([]Chat, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

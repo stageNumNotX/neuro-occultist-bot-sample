@@ -37,6 +37,18 @@ func TestMemory_chatsAndDeliveries(t *testing.T) {
 	if err != nil || was {
 		t.Fatalf("chat 2 should be independent, was=%v err=%v", was, err)
 	}
+
+	if err := m.RemoveChat(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	chats, err = m.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("after remove chats=%v err=%v", chats, err)
+	}
+	was, err = m.WasDelivered(ctx, 1, link)
+	if err != nil || !was {
+		t.Fatalf("remove must not erase delivery records, was=%v err=%v", was, err)
+	}
 }
 
 func TestMemory_pendingDigest(t *testing.T) {

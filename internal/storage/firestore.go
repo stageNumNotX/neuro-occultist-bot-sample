@@ -41,6 +41,14 @@ func (s *Firestore) SaveChat(ctx context.Context, chat Chat) error {
 	return err
 }
 
+func (s *Firestore) RemoveChat(ctx context.Context, chatID int64) error {
+	_, err := s.client.Collection(collectionChats).Doc(chatIDDoc(chatID)).Delete(ctx)
+	if err != nil && status.Code(err) != codes.NotFound {
+		return err
+	}
+	return nil
+}
+
 func (s *Firestore) ListChats(ctx context.Context) ([]Chat, error) {
 	snaps, err := s.client.Collection(collectionChats).Documents(ctx).GetAll()
 	if err != nil {
