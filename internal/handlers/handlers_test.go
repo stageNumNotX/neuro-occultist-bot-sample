@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -61,18 +62,20 @@ func (f *fakeBot) Broadcast(ctx context.Context, post string, img []byte, links 
 
 type fakeComposer struct {
 	post string
+	err  error
 }
 
 func (f fakeComposer) ComposePost(_ context.Context, _ []string) (string, error) {
-	return f.post, nil
+	return f.post, f.err
 }
 
 type fakeImages struct {
 	data []byte
+	err  error
 }
 
 func (f fakeImages) Generate(_ context.Context, _ string) ([]byte, error) {
-	return f.data, nil
+	return f.data, f.err
 }
 
 func testMux(cfg config.AppConfig, b BotService, agent *service.Agent, img *fakeImages) *http.ServeMux {
@@ -217,6 +220,65 @@ func TestBroadcast_successWithMockedLLM(t *testing.T) {
 	}
 }
 
+func TestBroadcast_imageErrorStillSends(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 1, Title: "chan"}); err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeBot{store: mem}
+	agent := service.NewAgent(mem, nil, fakeComposer{post: "hello aether"})
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		return []rss.Item{{Title: "Go 1.23", Link: "https://example.com/go"}}, nil
+	})
+	img := &fakeImages{err: errors.New("vertex generateContent 404")}
+	mux := testMux(config.AppConfig{BroadcastSecret: "abc"}, fb, agent, img)
+
+	req := httptest.NewRequest(http.MethodPost, "/broadcast", nil)
+	req.Header.Set("X-Broadcast-Secret", "abc")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if fb.broadcasts != 1 || fb.lastImgLen != 0 {
+		t.Fatalf("broadcasts=%d imgLen=%d", fb.broadcasts, fb.lastImgLen)
+	}
+	was, err := mem.WasDelivered(ctx, 1, "https://example.com/go")
+	if err != nil || !was {
+		t.Fatalf("successful text send after image failure should mark, was=%v err=%v", was, err)
+	}
+}
+
+func TestBroadcast_DoesNotMarkWhenComposeFails(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeBot{store: mem}
+	agent := service.NewAgent(mem, nil, fakeComposer{err: errors.New("gemini 404")})
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		return []rss.Item{{Title: "Go 1.23", Link: "https://example.com/go"}}, nil
+	})
+	mux := testMux(config.AppConfig{BroadcastSecret: "abc"}, fb, agent, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/broadcast", nil)
+	req.Header.Set("X-Broadcast-Secret", "abc")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if fb.broadcasts != 0 {
+		t.Fatalf("Broadcast must not run after LLM failure, calls=%d", fb.broadcasts)
+	}
+	was, err := mem.WasDelivered(ctx, 1, "https://example.com/go")
+	if err != nil || was {
+		t.Fatalf("LLM failure must not mark posted, was=%v err=%v", was, err)
+	}
+}
+
 func TestBroadcast_failedSendDoesNotMark(t *testing.T) {
 	ctx := context.Background()
 	mem := storage.NewMemory()
@@ -241,6 +303,28 @@ func TestBroadcast_failedSendDoesNotMark(t *testing.T) {
 	was, err := mem.WasDelivered(ctx, 1, "https://example.com/go")
 	if err != nil || was {
 		t.Fatalf("failed broadcast must not mark delivered, was=%v err=%v", was, err)
+	}
+}
+
+func TestBroadcast_stateSaveErrorIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeBot{err: bot.ErrStateSave}
+	agent := service.NewAgent(mem, nil, fakeComposer{post: "post"})
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		return []rss.Item{{Title: "Go 1.23", Link: "https://example.com/go"}}, nil
+	})
+	mux := testMux(config.AppConfig{BroadcastSecret: "abc"}, fb, agent, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/broadcast", nil)
+	req.Header.Set("X-Broadcast-Secret", "abc")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 const (
 	collectionChats      = "chats"
 	collectionDeliveries = "deliveries"
+	collectionState      = "bot_state"
+	pendingDigestDoc     = "pending_digest"
 )
 
 // Chat is a Telegram chat the bot was added to.
@@ -29,12 +31,25 @@ type Delivery struct {
 	CreatedAt time.Time `json:"created_at" firestore:"created_at"`
 }
 
-// Store persists chats and per-chat delivery of RSS links.
+// PendingDigest is a frozen broadcast batch. New RSS items wait until every
+// active saved chat has every link in this batch. There is no Telegram/store transaction.
+type PendingDigest struct {
+	Post  string   `json:"post" firestore:"post"`
+	Links []string `json:"links" firestore:"links"`
+	Texts []string `json:"texts" firestore:"texts"`
+}
+
+// Store persists chats, per-chat delivery of RSS links, and the frozen digest.
+// ListChats is the active recipient set used for broadcast and pending completion.
 type Store interface {
 	SaveChat(ctx context.Context, chat Chat) error
+	RemoveChat(ctx context.Context, chatID int64) error
 	ListChats(ctx context.Context) ([]Chat, error)
 	MarkDelivered(ctx context.Context, chatID int64, link string) error
 	WasDelivered(ctx context.Context, chatID int64, link string) (bool, error)
+	GetPendingDigest(ctx context.Context) (*PendingDigest, error)
+	SetPendingDigest(ctx context.Context, d PendingDigest) error
+	ClearPendingDigest(ctx context.Context) error
 	Close() error
 }
 

@@ -1,16 +1,18 @@
 # Neuro-Occultist Bot
 
-A small Go Telegram bot that reads public RSS feeds, asks an LLM to write a short mystical digest, and optionally illustrates it with Vertex AI Imagen. It is a compact example of a production-shaped **LLM pipeline**: ingest → filter → prompt → generate → deliver. The sequence of steps is fixed. The model does not choose tools or take autonomous actions. LLM and Telegram clients sit behind interfaces so the core path can be tested without live network calls.
+A small Go Telegram bot that reads public RSS feeds, asks Gemini to write one short mystical digest, and optionally illustrates it with a Vertex Gemini image model. The sequence is fixed: ingest → filter → prompt → generate → deliver. The model does **not** choose tools or take autonomous actions.
 
-Operator-facing command copy in this sample is English. The LLM is instructed to write the digest itself in Russian.
+It ran on a public Telegram channel: [Neuro-Occultist](https://t.me/Neuro_Occultist). Channel posts are in **Russian**, which is the default `DIGEST_LANGUAGE` (`ru` / `en` aliases). Operator-facing command copy in this sample is English.
+
+This repository is a public code sample of that **pipeline**, not an agent platform.
 
 ## What it does
 
-- **Ingest** headlines from configured RSS/Atom feeds.
-- **Filter** items that were already delivered to a given chat (Firestore, or an in-memory store locally). Delivery is per chat, so a failed recipient can be retried without resending to chats that already got the post.
-- **Generate** one short post with Gemini. Style and policy go in `GenerativeModel.SystemInstruction`. Headlines are sanitized and wrapped as `<untrusted-data>` in the user prompt. That wrapping reduces prompt-injection risk; it is not a guarantee that the model will ignore hostile text in a title.
-- **Deliver** the post to Telegram: a personal preview (`/rss_summary`) or an authenticated `POST /broadcast` to saved chats. Personal commands do not change broadcast delivery state.
-- **Optional images** from Vertex AI Imagen (`/vision`, `/news_vision`, and broadcast).
+- **Ingest** headlines from configured RSS/Atom feeds (one bad feed is skipped).
+- **Freeze a broadcast batch.** `POST /broadcast` composes one post from items that are not yet delivered to every saved chat, then stores that post and its links. New RSS items wait until every saved chat has every link in the frozen batch. Personal commands (`/rss_summary`, `/news_vision`) ignore the frozen batch and do not write delivery state.
+- **Generate** one short post with Gemini. Style and policy go in `GenerativeModel.SystemInstruction`. Headlines are sanitized and wrapped as `<untrusted-data>` in the user prompt. That wrapping lowers prompt-injection risk; it is not a guarantee.
+- **Deliver** the frozen post to saved chats. A chat is skipped when it already has **all** links in that batch. Telegram acceptance and store writes are tracked separately (see [Delivery semantics](#delivery-semantics)).
+- **Optional images** from Vertex `generateContent` (`VERTEX_IMAGE_MODEL`, default `gemini-2.5-flash-image`; PNG in `inlineData`). One image per broadcast is reused for every chat. If image generation fails, the text still sends. Photo captions are trimmed to Telegram’s **1024 UTF-16** limit; there is no follow-up text message. Compose or send failure returns HTTP 500 and does **not** mark RSS items posted.
 
 Chats are recorded when the bot is added as a member or administrator.
 
@@ -18,15 +20,62 @@ Chats are recorded when the bot is added as a member or administrator.
 
 ```mermaid
 flowchart LR
-  RSS[RSS feeds] --> Filter[Skip links already delivered to every chat]
-  Filter --> Prompt[User prompt<br/>untrusted-data wrapper]
+  RSS[RSS feeds] --> Pending{Frozen batch still open?}
+  Pending -->|yes| Post[Reuse frozen digest]
+  Pending -->|no| Filter[Items not delivered to every chat]
+  Filter --> Prompt[User prompt untrusted-data wrapper]
   Prompt --> LLM[Gemini + SystemInstruction]
-  LLM --> Post[Single digest]
+  LLM --> Post
   Post --> TG[Telegram chats]
   Filter --> ImgPrompt[Optional image prompt]
-  ImgPrompt --> Imagen[Vertex Imagen]
-  Imagen --> TG
+  ImgPrompt --> VertexImg[Vertex generateContent]
+  VertexImg --> TG
 ```
+
+## Demo
+
+Live output: [t.me/Neuro_Occultist](https://t.me/Neuro_Occultist) (Russian). Open the channel for real posts. This repo does not embed a Telegram screenshot.
+
+### Offline example (hand-written fixture, not a live run)
+
+The headlines and post below are a **hand-written fixture** so a reviewer can see the pipeline shape without GCP credentials. They are **not** a paste from the channel and were **not** produced by Gemini in CI.
+
+**Input headlines**
+
+- Go 1.23 released with range-over-func
+- Linux 6.11 lands with network stack tweaks
+
+**Example post in Russian** (what the bot generates by default; `DIGEST_LANGUAGE=Russian`)
+
+> В цифровом эфире снова вспыхнули два сигнала: Go 1.23 открыл range-over-func, а ядро Linux 6.11 подкрутило сетевой стек. Нейро-Оккультист не выдумывает релизы — только слушает ленту. ✨ Следите за каналом.
+
+**English translation for reviewers** (not sent by the bot unless `DIGEST_LANGUAGE` is English; not a second model run)
+
+> Two signals in the feed: Go 1.23 shipped range-over-func, and Linux 6.11 tuned the network stack. Neuro-Occultist does not invent releases — it only listens to the headlines. ✨ Follow the channel.
+
+The live binary still needs real `TELEGRAM_TOKEN` and `GEMINI_API_KEY`. Contributors can exercise the code without keys via `make test` (mocked LLM and Telegram).
+
+## Production usage
+
+This is a **low-traffic personal experiment**, not a high-scale service. Figures below are as of **2026-10-20**. Measured and estimated are listed separately. Token counts and dollar cost are unavailable (no Gemini token metrics, no billing export).
+
+### Measured
+
+Sources are in parentheses.
+
+- **Where it runs.** Cloud Run `us-central1` since 13 Aug 2025 (`creationTimestamp`). 1 vCPU, 512Mi, concurrency 80, max 3 instances. Observed max instances = 1 (Cloud Monitoring, 6 weeks).
+- **HTTP.** 8 Sep–20 Oct 2026: 1,016 requests (1,015 2xx, 1 5xx), typically ~24/day = hourly Cloud Scheduler (Monitoring `request_count`). For `/broadcast`, daily p50 latency median ~1.05 s, daily p95 latency median ~2.2 s (`request_latencies`).
+- **Broadcast outcomes.** Last ~30 days: ~539 scheduler runs logged a successful broadcast; 182 returned 204 no new items (Cloud Logging).
+- **Channel and store.** Public channel [t.me/Neuro_Occultist](https://t.me/Neuro_Occultist): 3 subscribers. Firestore: 5 chat docs, 12,956 delivery-record docs.
+- **Gemini outage, then fix.** From roughly Sep to 20 Oct 2026 Gemini text calls failed (`gemini-1.5-flash` retired; `gemini-2.5-flash` returned 404 “no longer available to new users” for this key). Production fell back to non-LLM text. On 2026-10-20 the text model was switched to `gemini-3.8-flash`. This sample’s default is that model; override with `GEMINI_MODEL`.
+- **Images.** Classic Vertex Imagen (`imagegeneration@006`, Imagen 3/4 `:predict`) was retired on **2026-06-30** and returns 404. Production now calls Vertex `generateContent` with `gemini-2.5-flash-image` and reads a PNG from `candidates[].content.parts[].inlineData`. E2E **2026-10-20 20:23 UTC**: HTTP 200, 5 images (~6.8 s each), all 5 chats received a post with an image. This sample generates **one** image per broadcast (not one per chat) and reuses it; override with `VERTEX_IMAGE_MODEL`. If image generation fails, the text still sends (and a successful send may mark delivery). Photo captions are trimmed to 1024 UTF-16 code units.
+
+This sample does **not** implement the production non-LLM text fallback. A failed Gemini call returns an error and does not mark RSS items as posted.
+
+### Estimated (not measured)
+
+- Webhook handler benchmark ~1.4 µs/op locally with stubs (a ceiling, not production latency).
+- Cloud Run allows 240 in-flight requests, but digest fan-out is bounded by Telegram limits as implemented (~30 msg/s global, ~1 msg/s per chat), so one digest realistically reaches hundreds of chats inside the 300 s Cloud Run timeout, not thousands. With a working LLM, model latency and RPM dominate.
 
 ## Project layout
 
@@ -36,15 +85,16 @@ flowchart LR
 | `internal/config` | Environment loading |
 | `internal/llm` | Gemini client and prompt construction |
 | `internal/rss` | Concurrent feed fetch |
-| `internal/service` | RSS → filter → LLM orchestration |
+| `internal/service` | RSS → filter → LLM orchestration, frozen digest |
 | `internal/bot` | Telegram commands, webhook, rate-limited broadcast |
 | `internal/handlers` | `/healthz`, `/webhook`, `/broadcast` |
-| `internal/image` | Vertex Imagen (optional) |
+| `internal/image` | Vertex `generateContent` image (optional) |
 | `internal/storage` | Firestore or in-memory store |
+| `eval/` | Fixed headline fixtures and eval criteria (no live scores) |
 
 ## Run locally
 
-Requires Go 1.26+.
+Requires Go 1.26+. The process always talks to real Telegram and Gemini; there is no offline provider in `cmd/bot`.
 
 ```bash
 cp .env.example .env
@@ -54,14 +104,15 @@ make run
 
 `BOT_MODE=polling` (the example default) uses Telegram long polling. No public URL is required. Open the bot in Telegram and send `/ping`. In polling mode the `/webhook` route is disabled.
 
-Firestore is optional. If `FIRESTORE_PROJECT_ID` is unset, chats and per-chat delivery records live in memory and reset on restart.
+If `BOT_MODE` is unset, the code defaults to `webhook` (meant for Cloud Run).
+
+Firestore is optional. If `FIRESTORE_PROJECT_ID` is unset, chats, delivery records, and the frozen digest live in memory and reset on restart.
 
 ### Docker
 
 ```bash
 cp .env.example .env
 docker compose up --build
-# or: make docker-build && make docker-run
 ```
 
 ### Webhook mode
@@ -89,6 +140,7 @@ Telegram sends `X-Telegram-Bot-Api-Secret-Token`. Requests without the matching 
 make test
 make vet
 make lint   # golangci-lint
+go test -race ./...
 ```
 
 Unit tests mock the LLM (`ComposePost`), intercept Telegram Bot API calls with a fake HTTP transport, and pin Gemini requests to an `httptest` server to assert that the API key is attached. RSS parsing is covered with `httptest` feeds. No live API keys are required.
@@ -97,20 +149,21 @@ Unit tests mock the LLM (`ComposePost`), intercept Telegram Bot API calls with a
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TELEGRAM_TOKEN` | yes | Bot token from [@BotFather](https://t.me/BotFather) |
-| `GEMINI_API_KEY` | yes | Gemini API key |
+| `TELEGRAM_TOKEN` | yes | Bot token from [@BotFather](https://t.me/BotFather) (`TELEGRAM_BOT_TOKEN` also accepted) |
+| `GEMINI_API_KEY` | yes | Gemini API key (`GOOGLE_API_KEY` also accepted) |
+| `DIGEST_LANGUAGE` | no | Digest language in the system instruction. Default `Russian`. Aliases: `ru`, `en` |
 | `BOT_MODE` | no | `polling` (local) or `webhook` (default if unset: `webhook`) |
 | `PORT` | no | HTTP port, default `8080` |
 | `WEBHOOK_SECRET` | webhook mode | Shared secret for Telegram webhook verification |
-| `BROADCAST_SECRET` | no | If set, `POST /broadcast` requires `X-Broadcast-Secret`. If unset, the route is disabled (404) |
+| `BROADCAST_SECRET` | no | If set, `POST /broadcast` requires `X-Broadcast-Secret` (or `X-Cron-Token`). If unset, the route is 404 |
 | `ADMIN_USER_IDS` | no | Comma-separated Telegram user IDs for `/status` and `/chats` |
-| `GEMINI_MODEL` | no | Default `gemini-3.5-flash` |
-| `RSS_FEEDS` | no | Comma-separated feed URLs |
-| `FIRESTORE_PROJECT_ID` | no | GCP project for persistence |
+| `GEMINI_MODEL` | no | Gemini model id. Default `gemini-3.8-flash` (production id as of 2026-10-20) |
+| `RSS_FEEDS` | no | Comma-separated feed URLs (`FEEDS` also accepted) |
+| `FIRESTORE_PROJECT_ID` | no | GCP project for persistence (`GOOGLE_CLOUD_PROJECT` also accepted) |
 | `FIRESTORE_DATABASE` | no | Firestore database id, default `(default)` |
-| `VERTEX_PROJECT_ID` | no | Enables Imagen; uses Application Default Credentials |
+| `VERTEX_PROJECT_ID` | no | Enables Vertex image generation; uses Application Default Credentials |
 | `VERTEX_LOCATION` | no | Default `us-central1` |
-| `VERTEX_IMAGE_MODEL` | no | Default `imagen-3.0-generate-001` |
+| `VERTEX_IMAGE_MODEL` | no | Default `gemini-2.5-flash-image` (Vertex `generateContent`; not classic Imagen `:predict`) |
 | `VERTEX_ASPECT_RATIO` | no | Default `1:1` |
 
 Copy `.env.example` to `.env`. Never commit `.env` or service-account JSON.
@@ -119,9 +172,10 @@ Copy `.env.example` to `.env`. Never commit `.env` or service-account JSON.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
+| `GET` | `/` | none | Name probe |
 | `GET` | `/healthz` | none | Liveness |
 | `POST` | `/webhook` | `X-Telegram-Bot-Api-Secret-Token` | Telegram updates (webhook mode only) |
-| `POST` | `/broadcast` | `X-Broadcast-Secret` | Fetch undelivered RSS, generate one post (and optional image), send to saved chats |
+| `POST` | `/broadcast` | `X-Broadcast-Secret` | Reuse or build a frozen digest, optional image, send to saved chats |
 
 Example broadcast (Cloud Scheduler, cron, or `curl`):
 
@@ -130,7 +184,39 @@ curl -sS -X POST "https://your-host/broadcast" \
   -H "X-Broadcast-Secret: ${BROADCAST_SECRET}"
 ```
 
-Failed or partial delivery is not recorded as success. The next run retries only chats that have not received the links yet.
+`204` means there were no headlines in the frozen/new batch. No saved chats is `500` (`no chats to broadcast to`), not `204`. Any send failure, including a Telegram success that did not fully persist delivery state, is also `500`.
+
+## Delivery semantics
+
+There is **no** shared transaction between Telegram and the store. Exactly-once delivery is not guaranteed.
+
+- After Telegram accepts a send, the bot writes one delivery record per RSS link for that chat. If a write fails, `Broadcast` returns an error (`ErrStateSave`). It does **not** report full success. The next run may still send that chat again, because the missing records look like “not delivered”. Returning the error does not remove that duplicate window.
+- A multi-link batch can be **partially** saved (first link written, later link failed). That chat is not treated as complete.
+- While a frozen digest is open, a new headline `Y` does not get merged into a retry of `X`. Recipients who already received `X` are skipped; `Y` becomes a later batch.
+- The frozen batch completes when every **active** chat has those links. A chat that left, kicked the bot, or returns a permanent Telegram error (kicked/blocked/not a member/chat not found) is removed from the recipient list. That chat is **not** marked delivered. If `RemoveChat` fails, `Broadcast` returns an error (`ErrRecipientDrop`) instead of success so the next run can retry the drop. Temporary send errors stay retryable.
+- `FetchUnsent` treats a link as “done” only when **every active** chat has it. Per-chat skipping at send time uses `chatHasAll` on the frozen link set.
+
+## Telegram commands
+
+| Command | Who | Effect |
+|---------|-----|--------|
+| `/start`, `/ping` | anyone | Intro / liveness |
+| `/rss_summary` | anyone | Personal digest of current RSS items (does not mark channel delivery) |
+| `/vision <text>` | anyone | Illustration of a description (Vertex image model) |
+| `/news_vision` | anyone | Illustration of current headlines (does not mark channel delivery) |
+| `/status`, `/chats` | `ADMIN_USER_IDS` only | Store/image status and saved chat list |
+
+User-facing errors are generic. Details go to process logs, not chat.
+
+There is **no** per-user quota on `/rss_summary`, `/vision`, or `/news_vision`. Anyone who can message the bot can trigger Gemini text or image calls. Broadcast sends are rate-limited (~30 msg/s global, 1/s per chat).
+
+## LLM eval
+
+`eval/cases.json` holds 15 fixed headline sets (empty input, duplicates, prompt injection, caps). Criteria are listed in `eval/README.md`.
+
+`go test ./internal/llm` checks prompt construction against that file. That is not a quality score.
+
+Operational Cloud Run / Scheduler / Logging numbers are in [Production usage](#production-usage). Token counts and cost are still unavailable. `go test` is not an eval score.
 
 ## Deploy (Cloud Run)
 
@@ -140,29 +226,55 @@ GitHub Actions secrets:
 
 - `GCP_PROJECT_ID`, `GCP_REGION`, `CLOUD_RUN_SERVICE`, `GCP_SA_KEY`
 - `TELEGRAM_TOKEN`, `WEBHOOK_SECRET`, `GEMINI_API_KEY`
-- optional: `RSS_FEEDS`, `BROADCAST_SECRET`, Vertex image settings
+- optional: `RSS_FEEDS`, `BROADCAST_SECRET`, Vertex image settings (`VERTEX_IMAGE_MODEL` defaults to `gemini-2.5-flash-image` in code)
 
-The service must be reachable by Telegram (`--allow-unauthenticated` on the HTTPS endpoint). After deploy, the workflow sets the webhook to `https://<service>/webhook`.
+The service must be reachable by Telegram (`--allow-unauthenticated` on the HTTPS endpoint). After deploy, the workflow sets the webhook to `https://<service>/webhook`. The workflow also sets `FIRESTORE_PROJECT_ID` and `VERTEX_PROJECT_ID` to the GCP project id.
 
-CI on every push/PR (`.github/workflows/ci.yml`) runs `go vet`, `go test`, and `golangci-lint`.
+CI on every push/PR (`.github/workflows/ci.yml`) runs `go vet`, `go test -race`, and `golangci-lint`.
 
-## Telegram commands
+## My contribution
 
-| Command | Who | Effect |
-|---------|-----|--------|
-| `/start`, `/ping` | anyone | Intro / liveness |
-| `/rss_summary` | anyone | Personal digest of current RSS items (does not mark channel delivery) |
-| `/vision <text>` | anyone | Imagen illustration of a description |
-| `/news_vision` | anyone | Illustration of current headlines (does not mark channel delivery) |
-| `/status`, `/chats` | `ADMIN_USER_IDS` only | Store/image status and saved chat list |
+I built this RSS → Gemini → Telegram pipeline and ran it on a public channel, [Neuro-Occultist](https://t.me/Neuro_Occultist). I checked quality by reading the posts in Telegram.
 
-User-facing errors are generic. Details go to process logs, not chat.
+This repository is the public sample of that pipeline (Go, optional Firestore, optional Vertex image generation, tests without live keys). Default digest language is Russian because that is the channel’s language.
+
+Hardening for the public sample (delivery retries, docs, eval fixtures) was done with Cursor agents and reviewed via pull request and CI.
+
+## Design decisions
+
+Observable in the code (not a biography):
+
+- **Fixed pipeline, not an agent.** One RSS fetch, at most one Gemini text completion per new batch, optional Vertex image (`generateContent`), then send. No tool calling, planner, or multi-step loop — cheaper and easier to test than an autonomous agent, and it matches what the binary does.
+- **Frozen digest for retries.** Partial Telegram failure plus a new RSS item used to resend `X` to a chat that already got `X`. The pending batch keeps the composed post and link set until every **active** chat has those links. Dead recipients are dropped so they cannot stall new posts for everyone else.
+- **Per-chat delivery hashes.** Success is recorded per `(chat, link)` so a failed recipient can be retried without a Telegram/store transaction.
+- **System instruction vs user data.** Style/security sit in `SystemInstruction`; headlines are sanitized and wrapped. Defense in depth, not a proof of injection resistance.
+- **Interfaces + `httptest`.** `llm.Composer`, `image.Generator`, and `storage.Store` let CI run without Gemini, Telegram, or Firestore.
+- **Firestore as a small experiment.** Optional serverless state on GCP (chats, delivery records, frozen digest) while running on Cloud Run. Local and tests use memory. This was not a Postgres bake-off.
+
+## Limitations
+
+- **Duplicates after a save failure.** Telegram can accept a message while `MarkDelivered` fails. The error is returned; the next broadcast may send that chat again. If only some links in a batch are saved, the chat is not complete and the **whole frozen post** may be sent again (this sample does not rewrite a partial link set).
+- **Store read errors look like “not delivered”.** A failed `WasDelivered` lookup skips the “already sent” check, so a transient read error can cause a resend.
+- **Concurrent broadcasts / multiple instances.** Two overlapping `/broadcast` runs can compose or send the same batch. There is no leader election or lease. The frozen batch stores post and links, not a snapshot of recipients: a chat added mid-retry receives the frozen post.
+- **Restricted / muted chats are not auto-dropped.** Only leave/kick member updates and a small set of permanent Telegram API errors remove a recipient. A 403 that is not kick/block still retries.
+- **Public generation commands are uncapped.** `/rss_summary`, `/vision`, and `/news_vision` have timeouts but no spend quota.
+- **In-memory mode loses state on restart** (chats, delivery records, frozen digest). If Firestore is configured but the client cannot be created, the process currently falls back to memory and logs that fact.
+- **Failed LLM generation or Telegram send does not mark RSS items as posted.** `BuildDigest` returns an error before a pending digest is saved and before Telegram send. `/broadcast` is then 500 and `Broadcast` is not called. A send failure also returns 500 and leaves delivery records unwritten so the items can retry. This sample has no non-LLM text fallback (production briefly did, Sep–20 Oct 2026; see Production usage). Image-generation failure is different: the post still goes out as text and a successful send **may** mark delivery.
+- **Long posts are truncated in the photo caption.** Telegram captions are capped at 1024 UTF-16 code units. There is **no** separate text message with the full post, so overflow is dropped from what subscribers see.
+- **One image per broadcast** in this sample, reused for every chat. Production’s 2026-10-20 E2E generated one image per chat (5 images).
+- **No Gemini retries or token budget** beyond prompt caps (8 items, 400 runes/item) and a 45s LLM timeout.
+- **RSS merge is not date-sorted**; a single failing feed is skipped.
+- **Firestore and live Vertex credentials are not unit-tested** (no emulator in CI). Image HTTP is covered with `httptest`.
 
 ## Security notes
 
 - Secrets belong in the environment or a secret manager, never in git.
-- User text and RSS titles are sanitized before they reach Gemini or Imagen. `<untrusted-data>` wrapping plus a separate system instruction lowers prompt-injection risk; it does not make injection impossible.
+- User text and RSS titles are sanitized before they reach Gemini (text or image). `<untrusted-data>` wrapping plus a separate system instruction lowers prompt-injection risk; it does not make injection impossible.
 - `/webhook` is disabled in polling mode. In webhook mode a missing or wrong secret is `401`.
 - `/broadcast` is off unless `BROADCAST_SECRET` is set.
 - The HTTP server sets read/write/idle timeouts; webhook bodies are capped at 1 MiB.
 - Admin commands that list chats are gated by Telegram user id.
+
+## License
+
+[MIT](LICENSE)

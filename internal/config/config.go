@@ -14,7 +14,7 @@ const (
 	ModePolling = "polling"
 )
 
-// VertexAI holds optional Imagen settings.
+// VertexAI holds optional Vertex image-generation settings.
 type VertexAI struct {
 	ProjectID   string
 	Location    string
@@ -33,6 +33,7 @@ type AppConfig struct {
 	FirestoreDB     string
 	GeminiAPIKey    string
 	GeminiModel     string
+	DigestLanguage  string
 	RSSFeeds        []string
 	AdminUserIDs    map[int64]struct{}
 	VertexAI        VertexAI
@@ -67,12 +68,13 @@ func Load() (AppConfig, error) {
 			os.Getenv("GEMINI_API_KEY"),
 			os.Getenv("GOOGLE_API_KEY"),
 		),
-		GeminiModel:  getenvDefault("GEMINI_MODEL", "gemini-3.5-flash"),
-		AdminUserIDs: parseIDSet(os.Getenv("ADMIN_USER_IDS")),
+		GeminiModel:    getenvDefault("GEMINI_MODEL", "gemini-3.8-flash"),
+		DigestLanguage: normalizeLanguage(os.Getenv("DIGEST_LANGUAGE")),
+		AdminUserIDs:   parseIDSet(os.Getenv("ADMIN_USER_IDS")),
 		VertexAI: VertexAI{
 			ProjectID:   firstNonEmpty(os.Getenv("VERTEX_PROJECT_ID"), os.Getenv("GOOGLE_CLOUD_PROJECT")),
 			Location:    getenvDefault("VERTEX_LOCATION", "us-central1"),
-			ImageModel:  getenvDefault("VERTEX_IMAGE_MODEL", "imagen-3.0-generate-001"),
+			ImageModel:  getenvDefault("VERTEX_IMAGE_MODEL", "gemini-2.5-flash-image"),
 			AspectRatio: getenvDefault("VERTEX_ASPECT_RATIO", "1:1"),
 		},
 	}
@@ -138,4 +140,21 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// normalizeLanguage maps common codes to a name the model prompt can use.
+// Empty / unknown values fall back to Russian, the original product voice.
+func normalizeLanguage(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "Russian"
+	}
+	switch strings.ToLower(s) {
+	case "ru", "rus", "russian":
+		return "Russian"
+	case "en", "eng", "english":
+		return "English"
+	default:
+		return s
+	}
 }

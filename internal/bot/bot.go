@@ -21,8 +21,9 @@ import (
 
 const (
 	userPromptMaxRunes = 400
-	captionMaxRunes    = 1000
-	genericError       = "Something went wrong. Please try again in a moment."
+	// Telegram photo captions are limited to 1024 UTF-16 code units.
+	captionMaxUTF16 = 1024
+	genericError    = "Something went wrong. Please try again in a moment."
 )
 
 var (
@@ -30,8 +31,14 @@ var (
 	ErrNoChats = errors.New("no chats to broadcast to")
 	// ErrAllFailed means every attempted send was rejected by Telegram.
 	ErrAllFailed = errors.New("broadcast failed for all chats")
-	// ErrPartial means at least one chat received the post and at least one did not.
+	// ErrPartial means Telegram accepted the post for some chats and rejected it for others.
 	ErrPartial = errors.New("broadcast delivered to some chats only")
+	// ErrStateSave means Telegram accepted one or more messages but delivery
+	// state was not fully persisted. The next run may send those chats again.
+	ErrStateSave = errors.New("broadcast sent but delivery state was not fully saved")
+	// ErrRecipientDrop means a chat is permanently unavailable but could not
+	// be removed from the active recipient list.
+	ErrRecipientDrop = errors.New("broadcast could not remove an unavailable recipient")
 )
 
 // Options wires Telegram, storage, the RSS/LLM pipeline, and optional images.
@@ -161,7 +168,7 @@ func (b *Bot) cmdVision(c tb.Context) error {
 		return c.Send(genericError)
 	}
 	photo := &tb.Photo{File: tb.FromReader(bytes.NewReader(img))}
-	photo.Caption = textutil.Truncate("Vision: "+prompt, captionMaxRunes)
+	photo.Caption = textutil.TruncateUTF16("Vision: "+prompt, captionMaxUTF16)
 	return c.Send(photo)
 }
 
@@ -194,7 +201,7 @@ func (b *Bot) cmdNewsVision(c tb.Context) error {
 		caption += "• " + t + "\n"
 	}
 	photo := &tb.Photo{File: tb.FromReader(bytes.NewReader(img))}
-	photo.Caption = textutil.Truncate(caption, captionMaxRunes)
+	photo.Caption = textutil.TruncateUTF16(caption, captionMaxUTF16)
 	return c.Send(photo)
 }
 
@@ -251,21 +258,29 @@ func (b *Bot) onMyChatMember(c tb.Context) error {
 	}
 	chat := upd.MyChatMember.Chat
 	role := upd.MyChatMember.NewChatMember.Role
-	if role != tb.Member && role != tb.Administrator {
-		return nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := b.store.SaveChat(ctx, storage.Chat{
-		ID:      chat.ID,
-		Title:   chat.Title,
-		Type:    string(chat.Type),
-		AddedAt: time.Now(),
-	}); err != nil {
-		log.Printf("save chat: %v", err)
+
+	switch role {
+	case tb.Left, tb.Kicked:
+		if err := b.store.RemoveChat(ctx, chat.ID); err != nil {
+			log.Printf("remove chat %d: %v", chat.ID, err)
+		}
+		return nil
+	case tb.Member, tb.Administrator, tb.Creator:
+		if err := b.store.SaveChat(ctx, storage.Chat{
+			ID:      chat.ID,
+			Title:   chat.Title,
+			Type:    string(chat.Type),
+			AddedAt: time.Now(),
+		}); err != nil {
+			log.Printf("save chat: %v", err)
+			return nil
+		}
+		return c.Send(fmt.Sprintf("Saved chat %q. Ready.", chat.Title))
+	default:
 		return nil
 	}
-	return c.Send(fmt.Sprintf("Saved chat %q. Ready.", chat.Title))
 }
 
 func (b *Bot) isAdmin(c tb.Context) bool {
@@ -321,9 +336,11 @@ func (b *Bot) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Broadcast sends one post (and optional image) to saved chats that have not
+// Broadcast sends one post (and optional image) to active chats that have not
 // yet received every link in this digest. Successful chats are recorded so a
-// retry skips them. Failed chats are left unmarked.
+// retry skips them. Temporary send failures leave the chat unmarked.
+// Permanent unavailability (kicked/blocked/not a member) removes the chat
+// without writing a fake delivery record.
 func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []string) error {
 	if b.store == nil {
 		return fmt.Errorf("store is not configured")
@@ -336,7 +353,7 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 		return ErrNoChats
 	}
 
-	var delivered, failed, skipped int
+	var sent, saved, unsaved, failed, skipped, dropFailed int
 	var firstErr error
 	for _, ch := range chats {
 		if err := ctx.Err(); err != nil {
@@ -352,24 +369,77 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 		chat := &tb.Chat{ID: ch.ID}
 		if err := b.sendOne(chat, post, img); err != nil {
 			log.Printf("send to chat %d failed: %v", ch.ID, err)
+			if isPermanentUnavailable(err) {
+				if dropErr := b.dropRecipient(ctx, ch.ID, err); dropErr != nil {
+					dropFailed++
+					if firstErr == nil {
+						firstErr = dropErr
+					}
+				}
+				continue
+			}
 			failed++
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
-		b.markChat(ctx, ch.ID, links)
-		delivered++
+		sent++
+		if err := b.markChat(ctx, ch.ID, links); err != nil {
+			log.Printf("delivery state not fully saved chat=%d: %v", ch.ID, err)
+			unsaved++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		saved++
 	}
 
 	switch {
-	case delivered == 0 && failed > 0 && skipped == 0:
+	case sent == 0 && failed > 0 && skipped == 0 && dropFailed == 0:
 		return fmt.Errorf("%w: %v", ErrAllFailed, firstErr)
+	case failed > 0 && unsaved > 0:
+		return fmt.Errorf("%w: %w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d dropFailed=%d: %v", ErrPartial, ErrStateSave, sent, saved, unsaved, failed, skipped, dropFailed, firstErr)
 	case failed > 0:
-		return fmt.Errorf("%w: delivered=%d failed=%d skipped=%d", ErrPartial, delivered, failed, skipped)
+		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d dropFailed=%d", ErrPartial, sent, saved, unsaved, failed, skipped, dropFailed)
+	case unsaved > 0:
+		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d skipped=%d dropFailed=%d: %v", ErrStateSave, sent, saved, unsaved, skipped, dropFailed, firstErr)
+	case dropFailed > 0:
+		return fmt.Errorf("%w: %v", ErrRecipientDrop, firstErr)
 	default:
 		return nil
 	}
+}
+
+func (b *Bot) dropRecipient(ctx context.Context, chatID int64, reason error) error {
+	log.Printf("dropping inactive chat %d: %v", chatID, reason)
+	if err := b.store.RemoveChat(ctx, chatID); err != nil {
+		log.Printf("remove chat %d: %v", chatID, err)
+		return err
+	}
+	return nil
+}
+
+func isPermanentUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, tb.ErrKickedFromGroup) ||
+		errors.Is(err, tb.ErrKickedFromSuperGroup) ||
+		errors.Is(err, tb.ErrKickedFromChannel) ||
+		errors.Is(err, tb.ErrBlockedByUser) ||
+		errors.Is(err, tb.ErrNotChannelMember) ||
+		errors.Is(err, tb.ErrChatNotFound) ||
+		errors.Is(err, tb.ErrUserIsDeactivated) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "bot was kicked") ||
+		strings.Contains(s, "bot was blocked") ||
+		strings.Contains(s, "bot is not a member") ||
+		strings.Contains(s, "chat not found") ||
+		strings.Contains(s, "user is deactivated")
 }
 
 func (b *Bot) chatHasAll(ctx context.Context, chatID int64, links []string) bool {
@@ -385,18 +455,26 @@ func (b *Bot) chatHasAll(ctx context.Context, chatID int64, links []string) bool
 	return true
 }
 
-func (b *Bot) markChat(ctx context.Context, chatID int64, links []string) {
+// markChat writes delivery records for every link. It keeps going after a
+// failure so a multi-link batch can be partially saved, and returns the first
+// MarkDelivered error. Telegram acceptance is tracked separately by Broadcast.
+func (b *Bot) markChat(ctx context.Context, chatID int64, links []string) error {
+	var firstErr error
 	for _, link := range links {
 		if err := b.store.MarkDelivered(ctx, chatID, link); err != nil {
-			log.Printf("mark delivered chat=%d: %v", chatID, err)
+			log.Printf("mark delivered chat=%d link=%s: %v", chatID, link, err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
 func (b *Bot) sendOne(chat *tb.Chat, post string, img []byte) error {
 	if len(img) > 0 {
 		photo := &tb.Photo{File: tb.FromReader(bytes.NewReader(img))}
-		photo.Caption = textutil.Truncate(post, captionMaxRunes)
+		photo.Caption = textutil.TruncateUTF16(post, captionMaxUTF16)
 		_, err := b.api.Send(chat, photo)
 		return err
 	}

@@ -18,6 +18,7 @@ import (
 	"neuro-occultist-bot/internal/rss"
 	"neuro-occultist-bot/internal/service"
 	"neuro-occultist-bot/internal/storage"
+	"neuro-occultist-bot/internal/textutil"
 )
 
 type fakeComposer struct {
@@ -41,13 +42,15 @@ type recordedSend struct {
 	Method string
 	ChatID string
 	Text   string
+	OK     bool
 }
 
 type telegramAPI struct {
 	mu      sync.Mutex
 	sends   []recordedSend
-	failFor map[string]bool
-	failNth map[int]bool
+	failFor map[string]bool // temporary (5xx); recipient stays active
+	goneFor map[string]bool // permanent kick/block; recipient must be dropped
+	failNth map[int]bool    // temporary
 	n       int
 }
 
@@ -57,14 +60,18 @@ func (a *telegramAPI) roundTrip(req *http.Request) (*http.Response, error) {
 	a.mu.Lock()
 	a.n++
 	n := a.n
-	fail := a.failFor[chatID] || a.failNth[n]
+	gone := a.goneFor[chatID]
+	fail := !gone && (a.failFor[chatID] || a.failNth[n])
 	if method == "sendMessage" || method == "sendPhoto" {
-		a.sends = append(a.sends, recordedSend{Method: method, ChatID: chatID, Text: text})
+		a.sends = append(a.sends, recordedSend{Method: method, ChatID: chatID, Text: text, OK: !gone && !fail})
 	}
 	a.mu.Unlock()
 
+	if gone {
+		return jsonResponse(http.StatusForbidden, `{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked from the channel chat"}`)
+	}
 	if fail {
-		return jsonResponse(http.StatusForbidden, `{"ok":false,"error_code":403,"description":"Forbidden: bot was kicked"}`)
+		return jsonResponse(http.StatusInternalServerError, `{"ok":false,"error_code":500,"description":"Internal Server Error"}`)
 	}
 	body := `{"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":1,"type":"channel"}}}`
 	if method == "sendPhoto" {
@@ -331,6 +338,431 @@ func TestStop_withoutStartReturns(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop hung on a bot that never started polling")
+	}
+}
+
+type markHookStore struct {
+	storage.Store
+	failLink  string
+	failChat  int64
+	failN     int
+	n         int
+	removeErr error
+}
+
+func (s *markHookStore) MarkDelivered(ctx context.Context, chatID int64, link string) error {
+	s.n++
+	if s.failChat != 0 && chatID == s.failChat {
+		return errors.New("mark failed")
+	}
+	if s.failLink != "" && link == s.failLink {
+		return errors.New("mark failed")
+	}
+	if s.failN > 0 && s.n == s.failN {
+		return errors.New("mark failed")
+	}
+	return s.Store.MarkDelivered(ctx, chatID, link)
+}
+
+func (s *markHookStore) RemoveChat(ctx context.Context, chatID int64) error {
+	if s.removeErr != nil {
+		return s.removeErr
+	}
+	return s.Store.RemoveChat(ctx, chatID)
+}
+
+func TestBroadcast_markFailureIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	store := &markHookStore{Store: mem, failN: 1}
+	api := &telegramAPI{}
+	b := testBot(t, store, nil, fakeImages{}, api, false)
+
+	err := b.Broadcast(ctx, "hello", nil, []string{"https://example.com/a"})
+	if !errors.Is(err, ErrStateSave) {
+		t.Fatalf("err=%v", err)
+	}
+	if n := len(api.snapshot()); n != 1 {
+		t.Fatalf("telegram must have accepted the send, sends=%d", n)
+	}
+	was, _ := mem.WasDelivered(ctx, 1, "https://example.com/a")
+	if was {
+		t.Fatal("failed MarkDelivered must not be treated as saved")
+	}
+}
+
+func TestBroadcast_partialLinkSetSave(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	links := []string{"https://example.com/a", "https://example.com/b"}
+	store := &markHookStore{Store: mem, failLink: links[1]}
+	api := &telegramAPI{}
+	b := testBot(t, store, nil, fakeImages{}, api, false)
+
+	err := b.Broadcast(ctx, "hello", nil, links)
+	if !errors.Is(err, ErrStateSave) {
+		t.Fatalf("err=%v", err)
+	}
+	wasA, _ := mem.WasDelivered(ctx, 1, links[0])
+	wasB, _ := mem.WasDelivered(ctx, 1, links[1])
+	if !wasA || wasB {
+		t.Fatalf("expected partial save wasA=%v wasB=%v", wasA, wasB)
+	}
+	if b.chatHasAll(ctx, 1, links) {
+		t.Fatal("partially saved link set must not count as fully delivered")
+	}
+}
+
+func TestBroadcast_mixedSendAndSaveErrors(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+	store := &markHookStore{Store: mem, failChat: 1}
+	api := &telegramAPI{failFor: map[string]bool{"2": true}}
+	b := testBot(t, store, nil, fakeImages{}, api, false)
+
+	err := b.Broadcast(ctx, "hello", nil, []string{"https://example.com/a"})
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrStateSave) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestBroadcast_rssChangeDoesNotResendToSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(mem, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+
+	api := &telegramAPI{failFor: map[string]bool{"2": true}}
+	b := testBot(t, mem, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1.Post != "DIGEST-X" {
+		t.Fatalf("first post=%q", d1.Post)
+	}
+	err = b.Broadcast(ctx, d1.Post, nil, d1.Links)
+	if !errors.Is(err, ErrPartial) {
+		t.Fatalf("first broadcast err=%v", err)
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	api.failFor = nil
+
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-X" {
+		t.Fatalf("retry post must stay frozen, got %q", d2.Post)
+	}
+	if err := b.Broadcast(ctx, d2.Post, nil, d2.Links); err != nil {
+		t.Fatalf("retry broadcast: %v", err)
+	}
+
+	accepted := func() (toA, toB []string) {
+		for _, s := range api.snapshot() {
+			if !s.OK {
+				continue
+			}
+			switch s.ChatID {
+			case "1":
+				toA = append(toA, s.Text)
+			case "2":
+				toB = append(toB, s.Text)
+			}
+		}
+		return toA, toB
+	}
+
+	toA, toB := accepted()
+	if len(toA) != 1 || toA[0] != "DIGEST-X" {
+		t.Fatalf("chat A accepted messages=%v", toA)
+	}
+	if len(toB) != 1 || toB[0] != "DIGEST-X" {
+		t.Fatalf("chat B accepted messages=%v", toB)
+	}
+
+	d3, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d3.Post != "DIGEST-Y" {
+		t.Fatalf("new batch post=%q", d3.Post)
+	}
+	if err := b.Broadcast(ctx, d3.Post, nil, d3.Links); err != nil {
+		t.Fatal(err)
+	}
+	toA, toB = accepted()
+	if len(toA) != 2 || toA[0] != "DIGEST-X" || toA[1] != "DIGEST-Y" {
+		t.Fatalf("chat A content=%v", toA)
+	}
+	if len(toB) != 2 || toB[0] != "DIGEST-X" || toB[1] != "DIGEST-Y" {
+		t.Fatalf("chat B content=%v", toB)
+	}
+	xCount := 0
+	for _, text := range toA {
+		if text == "DIGEST-X" {
+			xCount++
+		}
+	}
+	if xCount != 1 {
+		t.Fatalf("chat A must not receive X again after Y appeared, messages=%v", toA)
+	}
+}
+
+func TestBroadcast_permanentKickUnblocksNewDigest(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(mem, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+
+	api := &telegramAPI{goneFor: map[string]bool{"2": true}}
+	b := testBot(t, mem, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Broadcast(ctx, d1.Post, nil, d1.Links); err != nil {
+		t.Fatalf("first broadcast: %v", err)
+	}
+
+	chats, err := mem.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("kicked chat must be removed, chats=%v err=%v", chats, err)
+	}
+	wasB, _ := mem.WasDelivered(ctx, 2, "https://example.com/x")
+	if wasB {
+		t.Fatal("kicked chat must not be marked delivered")
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-Y" {
+		t.Fatalf("after dropping B, next digest must be Y, got %q", d2.Post)
+	}
+	if err := b.Broadcast(ctx, d2.Post, nil, d2.Links); err != nil {
+		t.Fatal(err)
+	}
+
+	var toA []string
+	for _, s := range api.snapshot() {
+		if s.OK && s.ChatID == "1" {
+			toA = append(toA, s.Text)
+		}
+	}
+	if len(toA) != 2 || toA[0] != "DIGEST-X" || toA[1] != "DIGEST-Y" {
+		t.Fatalf("chat A content=%v", toA)
+	}
+}
+
+func TestBroadcast_removeChatFailureIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+	store := &markHookStore{Store: mem, removeErr: errors.New("firestore down")}
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(store, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+	api := &telegramAPI{goneFor: map[string]bool{"2": true}}
+	b := testBot(t, store, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = b.Broadcast(ctx, d1.Post, nil, d1.Links)
+	if !errors.Is(err, ErrRecipientDrop) {
+		t.Fatalf("failed RemoveChat must not look like success, err=%v", err)
+	}
+
+	chats, err := mem.ListChats(ctx)
+	if err != nil || len(chats) != 2 {
+		t.Fatalf("B must stay active after failed drop, chats=%v err=%v", chats, err)
+	}
+	wasB, _ := mem.WasDelivered(ctx, 2, "https://example.com/x")
+	if wasB {
+		t.Fatal("failed drop must not write a fake delivery")
+	}
+
+	dFrozen, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dFrozen.Post != "DIGEST-X" {
+		t.Fatalf("pending X must stay open while B is still listed, got %q", dFrozen.Post)
+	}
+
+	store.removeErr = nil
+	if err := b.Broadcast(ctx, dFrozen.Post, nil, dFrozen.Links); err != nil {
+		t.Fatalf("retry drop: %v", err)
+	}
+	chats, err = mem.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("retry must remove B, chats=%v err=%v", chats, err)
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-Y" {
+		t.Fatalf("after successful drop, next digest must be Y, got %q", d2.Post)
+	}
+}
+
+func TestMyChatMember_kickedUnblocksPending(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(mem, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+	api := &telegramAPI{failFor: map[string]bool{"2": true}}
+	b := testBot(t, mem, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = b.Broadcast(ctx, d1.Post, nil, d1.Links)
+	if !errors.Is(err, ErrPartial) {
+		t.Fatalf("temporary fail should stay retryable, err=%v", err)
+	}
+
+	b.ProcessUpdate(tb.Update{
+		MyChatMember: &tb.ChatMemberUpdate{
+			Chat:          &tb.Chat{ID: 2, Title: "B", Type: tb.ChatChannel},
+			NewChatMember: &tb.ChatMember{Role: tb.Kicked, User: &tb.User{ID: 0}},
+		},
+	})
+
+	chats, err := mem.ListChats(ctx)
+	if err != nil || len(chats) != 1 || chats[0].ID != 1 {
+		t.Fatalf("leave/kick must remove B, chats=%v err=%v", chats, err)
+	}
+	wasB, _ := mem.WasDelivered(ctx, 2, d1.Links[0])
+	if wasB {
+		t.Fatal("kick must not write a fake delivery")
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-Y" {
+		t.Fatalf("removing B via my_chat_member must release the batch, got %q", d2.Post)
+	}
+}
+
+type scriptedComposer struct {
+	posts []string
+	n     int
+}
+
+func (s *scriptedComposer) ComposePost(_ context.Context, _ []string) (string, error) {
+	if s.n >= len(s.posts) {
+		return "", errors.New("unexpected extra compose")
+	}
+	post := s.posts[s.n]
+	s.n++
+	return post, nil
+}
+
+func TestBroadcast_photoCaptionTrimmedToUTF16(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	api := &telegramAPI{}
+	b := testBot(t, mem, nil, fakeImages{data: []byte("PNG")}, api, false)
+
+	post := strings.Repeat("a", 2000)
+	if err := b.Broadcast(ctx, post, []byte("PNG"), []string{"https://example.com/a"}); err != nil {
+		t.Fatal(err)
+	}
+	sends := api.snapshot()
+	if len(sends) != 1 || sends[0].Method != "sendPhoto" {
+		t.Fatalf("sends=%+v", sends)
+	}
+	caption := sends[0].Text
+	if n := textutil.UTF16Len(caption); n > captionMaxUTF16 {
+		t.Fatalf("caption utf16=%d", n)
+	}
+	if textutil.UTF16Len(caption) != captionMaxUTF16 {
+		t.Fatalf("caption utf16=%d want %d", textutil.UTF16Len(caption), captionMaxUTF16)
+	}
+	if !strings.HasSuffix(caption, "…") {
+		t.Fatal("long caption must end with an ellipsis")
+	}
+}
+
+func TestBroadcast_photoCaptionCountsEmojiAsTwoUTF16(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	api := &telegramAPI{}
+	b := testBot(t, mem, nil, fakeImages{data: []byte("PNG")}, api, false)
+
+	post := strings.Repeat("😀", 600) // 1200 UTF-16 code units
+	if err := b.Broadcast(ctx, post, []byte("PNG"), []string{"https://example.com/a"}); err != nil {
+		t.Fatal(err)
+	}
+	caption := api.snapshot()[0].Text
+	if n := textutil.UTF16Len(caption); n > captionMaxUTF16 {
+		t.Fatalf("emoji caption utf16=%d", n)
+	}
+	if !strings.HasSuffix(caption, "…") {
+		t.Fatal("over-budget emoji caption must be trimmed")
 	}
 }
 

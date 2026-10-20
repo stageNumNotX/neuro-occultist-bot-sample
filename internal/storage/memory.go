@@ -12,6 +12,7 @@ type Memory struct {
 	mu         sync.Mutex
 	chats      map[int64]Chat
 	deliveries map[string]Delivery
+	pending    *PendingDigest
 }
 
 // NewMemory returns an empty in-memory store.
@@ -26,6 +27,13 @@ func (m *Memory) SaveChat(_ context.Context, chat Chat) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.chats[chat.ID] = chat
+	return nil
+}
+
+func (m *Memory) RemoveChat(_ context.Context, chatID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.chats, chatID)
 	return nil
 }
 
@@ -60,4 +68,37 @@ func (m *Memory) WasDelivered(_ context.Context, chatID int64, link string) (boo
 	return ok, nil
 }
 
+func (m *Memory) GetPendingDigest(_ context.Context) (*PendingDigest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pending == nil {
+		return nil, nil
+	}
+	return clonePending(m.pending), nil
+}
+
+func (m *Memory) SetPendingDigest(_ context.Context, d PendingDigest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = clonePending(&d)
+	return nil
+}
+
+func (m *Memory) ClearPendingDigest(_ context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = nil
+	return nil
+}
+
 func (m *Memory) Close() error { return nil }
+
+func clonePending(d *PendingDigest) *PendingDigest {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	out.Links = append([]string(nil), d.Links...)
+	out.Texts = append([]string(nil), d.Texts...)
+	return &out
+}

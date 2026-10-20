@@ -15,6 +15,9 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	t.Setenv("RSS_FEEDS", "")
 	t.Setenv("FEEDS", "")
 	t.Setenv("ADMIN_USER_IDS", "42, 99")
+	t.Setenv("GEMINI_MODEL", "")
+	t.Setenv("VERTEX_IMAGE_MODEL", "")
+	t.Setenv("VERTEX_PROJECT_ID", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -34,6 +37,30 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	}
 	if _, ok := cfg.AdminUserIDs[99]; !ok {
 		t.Fatal("admin 99 missing")
+	}
+	if cfg.DigestLanguage != "Russian" {
+		t.Fatalf("default digest language=%q", cfg.DigestLanguage)
+	}
+	if cfg.GeminiModel != "gemini-3.8-flash" {
+		t.Fatalf("default gemini model=%q", cfg.GeminiModel)
+	}
+	if cfg.VertexAI.ImageModel != "gemini-2.5-flash-image" {
+		t.Fatalf("default vertex image model=%q", cfg.VertexAI.ImageModel)
+	}
+}
+
+func TestLoad_digestLanguageAliases(t *testing.T) {
+	t.Setenv("BOT_MODE", "polling")
+	t.Setenv("TELEGRAM_TOKEN", "t")
+	t.Setenv("GEMINI_API_KEY", "g")
+	t.Setenv("DIGEST_LANGUAGE", "en")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DigestLanguage != "English" {
+		t.Fatalf("language=%q", cfg.DigestLanguage)
 	}
 }
 

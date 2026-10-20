@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -16,23 +17,30 @@ import (
 	"neuro-occultist-bot/internal/textutil"
 )
 
-const maxPromptRunes = 500
+const (
+	maxPromptRunes    = 500
+	defaultImageModel = "gemini-2.5-flash-image"
+	maxResponseBytes  = 8 << 20
+)
 
 // Generator produces an image from a text prompt.
 type Generator interface {
 	Generate(ctx context.Context, prompt string) ([]byte, error)
 }
 
-// Client calls Vertex AI Imagen.
+// Client calls Vertex AI generateContent for a Gemini image model.
+// Classic Imagen :predict (imagegeneration@006, imagen-3/4) was retired
+// on 2026-06-30 and returns 404.
 type Client struct {
 	project    string
 	location   string
 	model      string
 	aspect     string
 	httpClient *http.Client
+	apiRoot    string // optional override for tests (httptest)
 }
 
-// Config is Vertex Imagen settings.
+// Config is Vertex image-generation settings.
 type Config struct {
 	ProjectID   string
 	Location    string
@@ -40,7 +48,7 @@ type Config struct {
 	AspectRatio string
 }
 
-// NewClient builds a Vertex Imagen client using Application Default Credentials.
+// NewClient builds a Vertex image client using Application Default Credentials.
 func NewClient(cfg Config) (*Client, error) {
 	if cfg.ProjectID == "" {
 		return nil, fmt.Errorf("VERTEX_PROJECT_ID is required for image generation")
@@ -51,64 +59,85 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("vertex credentials: %w", err)
 	}
 	httpClient.Timeout = 60 * time.Second
+	return newClient(cfg, httpClient, ""), nil
+}
 
+func newClient(cfg Config, httpClient *http.Client, apiRoot string) *Client {
 	if cfg.Location == "" {
 		cfg.Location = "us-central1"
 	}
 	if cfg.ImageModel == "" {
-		cfg.ImageModel = "imagen-3.0-generate-001"
+		cfg.ImageModel = defaultImageModel
 	}
 	if cfg.AspectRatio == "" {
 		cfg.AspectRatio = "1:1"
 	}
-
 	return &Client{
 		project:    cfg.ProjectID,
 		location:   cfg.Location,
 		model:      cfg.ImageModel,
 		aspect:     cfg.AspectRatio,
 		httpClient: httpClient,
-	}, nil
+		apiRoot:    apiRoot,
+	}
 }
 
-type predictRequest struct {
-	Instances  []map[string]any `json:"instances"`
-	Parameters map[string]any   `json:"parameters,omitempty"`
+type generateContentResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []struct {
+				InlineData *struct {
+					MimeType string `json:"mimeType"`
+					Data     string `json:"data"`
+				} `json:"inlineData"`
+			} `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
 }
 
-type predictResponse struct {
-	Predictions []struct {
-		BytesBase64Encoded string `json:"bytesBase64Encoded"`
-	} `json:"predictions"`
+func (c *Client) generateURL() string {
+	root := strings.TrimRight(c.apiRoot, "/")
+	if root == "" {
+		root = fmt.Sprintf("https://%s-aiplatform.googleapis.com", c.location)
+	}
+	return fmt.Sprintf(
+		"%s/v1/projects/%s/locations/%s/publishers/google/models/%s:generateContent",
+		root,
+		url.PathEscape(c.project),
+		url.PathEscape(c.location),
+		url.PathEscape(c.model),
+	)
 }
 
-// Generate renders a PNG (or JPEG) from a user/news prompt.
+// Generate renders a PNG (or JPEG) from a user/news prompt via generateContent.
 func (c *Client) Generate(ctx context.Context, prompt string) ([]byte, error) {
 	if c == nil || c.httpClient == nil {
 		return nil, fmt.Errorf("image client is not initialized")
 	}
 
-	url := fmt.Sprintf(
-		"https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/%s:predict",
-		c.location, c.project, c.location, c.model,
-	)
-
-	reqBody := predictRequest{
-		Instances: []map[string]any{
-			{"prompt": BuildImagePrompt(prompt)},
+	genCfg := map[string]any{
+		"responseModalities": []string{"TEXT", "IMAGE"},
+	}
+	if c.aspect != "" {
+		genCfg["imageConfig"] = map[string]any{"aspectRatio": c.aspect}
+	}
+	reqBody := map[string]any{
+		"contents": []map[string]any{
+			{
+				"role": "user",
+				"parts": []map[string]any{
+					{"text": BuildImagePrompt(prompt)},
+				},
+			},
 		},
-		Parameters: map[string]any{
-			"sampleCount":    1,
-			"aspectRatio":    c.aspect,
-			"negativePrompt": "low quality, blurry, pixelated, watermark, text, logo, collage",
-		},
+		"generationConfig": genCfg,
 	}
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.generateURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -120,27 +149,39 @@ func (c *Client) Generate(ctx context.Context, prompt string) ([]byte, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("vertex predict failed: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("vertex generateContent failed: status %d", resp.StatusCode)
 	}
 
-	var pr predictResponse
-	if err := json.Unmarshal(respBody, &pr); err != nil {
+	var parsed generateContentResponse
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
 		return nil, fmt.Errorf("decode vertex response: %w", err)
 	}
-	if len(pr.Predictions) == 0 || pr.Predictions[0].BytesBase64Encoded == "" {
-		return nil, fmt.Errorf("vertex: empty predictions")
+	raw, err := firstInlineImage(parsed)
+	if err != nil {
+		return nil, err
 	}
-
-	img, err := base64.StdEncoding.DecodeString(pr.Predictions[0].BytesBase64Encoded)
+	img, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
 		return nil, fmt.Errorf("decode image: %w", err)
 	}
 	return img, nil
+}
+
+func firstInlineImage(resp generateContentResponse) (string, error) {
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			if part.InlineData == nil || part.InlineData.Data == "" {
+				continue
+			}
+			return part.InlineData.Data, nil
+		}
+	}
+	return "", fmt.Errorf("vertex: no image in generateContent response")
 }
 
 // BuildImagePrompt wraps untrusted text in a fixed artistic instruction.
