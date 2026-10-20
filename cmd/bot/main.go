@@ -50,7 +50,7 @@ func main() {
 			log.Printf("image generation disabled: %v", err)
 		} else {
 			images = ic
-			log.Printf("image generation enabled (Vertex AI)")
+			log.Printf("image generation enabled (Vertex generateContent, model=%s)", cfg.VertexAI.ImageModel)
 		}
 	}
 

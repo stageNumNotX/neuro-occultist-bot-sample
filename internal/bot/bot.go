@@ -21,8 +21,9 @@ import (
 
 const (
 	userPromptMaxRunes = 400
-	captionMaxRunes    = 1000
-	genericError       = "Something went wrong. Please try again in a moment."
+	// Telegram photo captions are limited to 1024 UTF-16 code units.
+	captionMaxUTF16 = 1024
+	genericError    = "Something went wrong. Please try again in a moment."
 )
 
 var (
@@ -167,7 +168,7 @@ func (b *Bot) cmdVision(c tb.Context) error {
 		return c.Send(genericError)
 	}
 	photo := &tb.Photo{File: tb.FromReader(bytes.NewReader(img))}
-	photo.Caption = textutil.Truncate("Vision: "+prompt, captionMaxRunes)
+	photo.Caption = textutil.TruncateUTF16("Vision: "+prompt, captionMaxUTF16)
 	return c.Send(photo)
 }
 
@@ -200,7 +201,7 @@ func (b *Bot) cmdNewsVision(c tb.Context) error {
 		caption += "• " + t + "\n"
 	}
 	photo := &tb.Photo{File: tb.FromReader(bytes.NewReader(img))}
-	photo.Caption = textutil.Truncate(caption, captionMaxRunes)
+	photo.Caption = textutil.TruncateUTF16(caption, captionMaxUTF16)
 	return c.Send(photo)
 }
 
@@ -473,7 +474,7 @@ func (b *Bot) markChat(ctx context.Context, chatID int64, links []string) error 
 func (b *Bot) sendOne(chat *tb.Chat, post string, img []byte) error {
 	if len(img) > 0 {
 		photo := &tb.Photo{File: tb.FromReader(bytes.NewReader(img))}
-		photo.Caption = textutil.Truncate(post, captionMaxRunes)
+		photo.Caption = textutil.TruncateUTF16(post, captionMaxUTF16)
 		_, err := b.api.Send(chat, photo)
 		return err
 	}

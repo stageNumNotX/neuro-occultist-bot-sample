@@ -16,6 +16,8 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	t.Setenv("FEEDS", "")
 	t.Setenv("ADMIN_USER_IDS", "42, 99")
 	t.Setenv("GEMINI_MODEL", "")
+	t.Setenv("VERTEX_IMAGE_MODEL", "")
+	t.Setenv("VERTEX_PROJECT_ID", "")
 
 	cfg, err := Load()
 	if err != nil {
@@ -41,6 +43,9 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	}
 	if cfg.GeminiModel != "gemini-3.8-flash" {
 		t.Fatalf("default gemini model=%q", cfg.GeminiModel)
+	}
+	if cfg.VertexAI.ImageModel != "gemini-2.5-flash-image" {
+		t.Fatalf("default vertex image model=%q", cfg.VertexAI.ImageModel)
 	}
 }
 

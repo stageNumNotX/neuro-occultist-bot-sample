@@ -18,6 +18,7 @@ import (
 	"neuro-occultist-bot/internal/rss"
 	"neuro-occultist-bot/internal/service"
 	"neuro-occultist-bot/internal/storage"
+	"neuro-occultist-bot/internal/textutil"
 )
 
 type fakeComposer struct {
@@ -716,6 +717,53 @@ func (s *scriptedComposer) ComposePost(_ context.Context, _ []string) (string, e
 	post := s.posts[s.n]
 	s.n++
 	return post, nil
+}
+
+func TestBroadcast_photoCaptionTrimmedToUTF16(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	api := &telegramAPI{}
+	b := testBot(t, mem, nil, fakeImages{data: []byte("PNG")}, api, false)
+
+	post := strings.Repeat("a", 2000)
+	if err := b.Broadcast(ctx, post, []byte("PNG"), []string{"https://example.com/a"}); err != nil {
+		t.Fatal(err)
+	}
+	sends := api.snapshot()
+	if len(sends) != 1 || sends[0].Method != "sendPhoto" {
+		t.Fatalf("sends=%+v", sends)
+	}
+	caption := sends[0].Text
+	if n := textutil.UTF16Len(caption); n > captionMaxUTF16 {
+		t.Fatalf("caption utf16=%d", n)
+	}
+	if textutil.UTF16Len(caption) != captionMaxUTF16 {
+		t.Fatalf("caption utf16=%d want %d", textutil.UTF16Len(caption), captionMaxUTF16)
+	}
+	if !strings.HasSuffix(caption, "…") {
+		t.Fatal("long caption must end with an ellipsis")
+	}
+}
+
+func TestBroadcast_photoCaptionCountsEmojiAsTwoUTF16(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	api := &telegramAPI{}
+	b := testBot(t, mem, nil, fakeImages{data: []byte("PNG")}, api, false)
+
+	post := strings.Repeat("😀", 600) // 1200 UTF-16 code units
+	if err := b.Broadcast(ctx, post, []byte("PNG"), []string{"https://example.com/a"}); err != nil {
+		t.Fatal(err)
+	}
+	caption := api.snapshot()[0].Text
+	if n := textutil.UTF16Len(caption); n > captionMaxUTF16 {
+		t.Fatalf("emoji caption utf16=%d", n)
+	}
+	if !strings.HasSuffix(caption, "…") {
+		t.Fatal("over-budget emoji caption must be trimmed")
+	}
 }
 
 func TestBroadcast_sendUsesTelegramHTTP(t *testing.T) {

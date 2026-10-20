@@ -14,7 +14,7 @@ const (
 	ModePolling = "polling"
 )
 
-// VertexAI holds optional Imagen settings.
+// VertexAI holds optional Vertex image-generation settings.
 type VertexAI struct {
 	ProjectID   string
 	Location    string
@@ -74,7 +74,7 @@ func Load() (AppConfig, error) {
 		VertexAI: VertexAI{
 			ProjectID:   firstNonEmpty(os.Getenv("VERTEX_PROJECT_ID"), os.Getenv("GOOGLE_CLOUD_PROJECT")),
 			Location:    getenvDefault("VERTEX_LOCATION", "us-central1"),
-			ImageModel:  getenvDefault("VERTEX_IMAGE_MODEL", "imagen-3.0-generate-001"),
+			ImageModel:  getenvDefault("VERTEX_IMAGE_MODEL", "gemini-2.5-flash-image"),
 			AspectRatio: getenvDefault("VERTEX_ASPECT_RATIO", "1:1"),
 		},
 	}
