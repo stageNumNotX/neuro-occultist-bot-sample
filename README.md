@@ -2,9 +2,9 @@
 
 A small Go Telegram bot that reads public RSS feeds, asks Gemini to write one short mystical digest, and optionally illustrates it with Vertex AI Imagen. The sequence is fixed: ingest → filter → prompt → generate → deliver. The model does **not** choose tools or take autonomous actions.
 
-Operator-facing command copy in this sample is English. Generated posts default to **Russian** (`DIGEST_LANGUAGE`; aliases `ru` / `en`).
+It ran on a public Telegram channel: [Neuro-Occultist](https://t.me/Neuro_Occultist). Channel posts are in **Russian**, which is the default `DIGEST_LANGUAGE` (`ru` / `en` aliases). Operator-facing command copy in this sample is English.
 
-This is a public code sample of a production-shaped LLM **pipeline**, not an agent platform.
+This repository is a public code sample of that **pipeline**, not an agent platform.
 
 ## What it does
 
@@ -34,24 +34,26 @@ flowchart LR
 
 ## Demo
 
-### Offline example (fixture, not a live model run)
+Live output: [t.me/Neuro_Occultist](https://t.me/Neuro_Occultist) (Russian). Open the channel for real posts. This repo does not embed a Telegram screenshot.
 
-The headlines and post below are a **hand-written fixture** so a reviewer can see the pipeline shape without GCP or Telegram. They were **not** produced by Gemini in this environment. No live Telegram screenshot is included.
+### Offline example (hand-written fixture, not a live run)
+
+The headlines and post below are a **hand-written fixture** so a reviewer can see the pipeline shape without GCP credentials. They are **not** a paste from the channel and were **not** produced by Gemini in CI.
 
 **Input headlines**
 
 - Go 1.23 released with range-over-func
 - Linux 6.11 lands with network stack tweaks
 
-**Example post** (Russian, the default `DIGEST_LANGUAGE`)
+**Example post in Russian** (what the bot generates by default; `DIGEST_LANGUAGE=Russian`)
 
 > В цифровом эфире снова вспыхнули два сигнала: Go 1.23 открыл range-over-func, а ядро Linux 6.11 подкрутило сетевой стек. Нейро-Оккультист не выдумывает релизы — только слушает ленту. ✨ Следите за каналом.
 
-**English translation** (for reviewers; the bot sends this only if `DIGEST_LANGUAGE` is English)
+**English translation for reviewers** (not sent by the bot unless `DIGEST_LANGUAGE` is English; not a second model run)
 
 > Two signals in the feed: Go 1.23 shipped range-over-func, and Linux 6.11 tuned the network stack. Neuro-Occultist does not invent releases — it only listens to the headlines. ✨ Follow the channel.
 
-Live binary still needs real `TELEGRAM_TOKEN` and `GEMINI_API_KEY`. Contributors can exercise the pipeline without keys via `make test` (mocked LLM and Telegram).
+The live binary still needs real `TELEGRAM_TOKEN` and `GEMINI_API_KEY`. Contributors can exercise the code without keys via `make test` (mocked LLM and Telegram).
 
 ## Project layout
 
@@ -189,7 +191,9 @@ There is **no** per-user quota on `/rss_summary`, `/vision`, or `/news_vision`. 
 
 `eval/cases.json` holds 15 fixed headline sets (empty input, duplicates, prompt injection, caps). Criteria are listed in `eval/README.md`.
 
-`go test ./internal/llm` checks prompt construction against that file. **No live Gemini measurements** (tokens, latency, cost) are recorded in this repository.
+`go test ./internal/llm` checks prompt construction against that file. That is not a quality score.
+
+Live GCP usage and eval numbers are being collected separately and are **not in this repository**. This revision does not record model id, example count, latency, tokens, or cost.
 
 ## Deploy (Cloud Run)
 
@@ -207,15 +211,11 @@ CI on every push/PR (`.github/workflows/ci.yml`) runs `go vet`, `go test -race`,
 
 ## My contribution
 
-This repository is a public Go sample of a fixed RSS → Gemini → Telegram pipeline, with optional Firestore and Vertex Imagen, plus tests that run without live keys.
+I built this RSS → Gemini → Telegram pipeline and ran it on a public channel, [Neuro-Occultist](https://t.me/Neuro_Occultist). I checked quality by reading the posts in Telegram.
 
-Confirmed from the repo itself:
+This repository is the public sample of that pipeline (Go, optional Firestore, optional Vertex Imagen, tests without live keys). Default digest language is Russian because that is the channel’s language.
 
-- GitHub description: “Public sample: Telegram occultist bot (Gemini, RSS broadcast, optional Firestore/Vertex)”.
-- Initial public commit on `main`, authored as Timofei Anashko.
-- Operator UI in English; default digest language Russian, overridable via `DIGEST_LANGUAGE`.
-
-This README does **not** claim production traffic, a live channel, business impact, or a specific AI-assisted workflow. Those are not recorded in the tree.
+Hardening for the public sample (delivery retries, docs, eval fixtures) was done with Cursor agents and reviewed via pull request and CI.
 
 ## Design decisions
 
@@ -226,7 +226,7 @@ Observable in the code (not a biography):
 - **Per-chat delivery hashes.** Success is recorded per `(chat, link)` so a failed recipient can be retried without a Telegram/store transaction.
 - **System instruction vs user data.** Style/security sit in `SystemInstruction`; headlines are sanitized and wrapped. Defense in depth, not a proof of injection resistance.
 - **Interfaces + `httptest`.** `llm.Composer`, `image.Generator`, and `storage.Store` let CI run without Gemini, Telegram, or Firestore.
-- **Firestore optional.** Local and tests use memory. Cloud Run can persist chats, delivery records, and the pending digest.
+- **Firestore as a small experiment.** Optional serverless state on GCP (chats, delivery records, frozen digest) while running on Cloud Run. Local and tests use memory. This was not a Postgres bake-off.
 
 ## Limitations
 

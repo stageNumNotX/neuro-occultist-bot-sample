@@ -17,16 +17,6 @@ Unit tests assert prompt wrapping, truncation, and empty-input errors. They do *
 
 ## Measurements
 
-**Absent in this revision.** No live Gemini run was executed here (no API keys in CI). There are no token counts, latencies, or cost figures to report.
+Live GCP usage and eval numbers are being collected separately. They are **not in this directory**: no model id, date, example count, latency, tokens, or cost.
 
-To run a live pass on your own machine:
-
-```bash
-export GEMINI_API_KEY=...
-export DIGEST_LANGUAGE=Russian   # or English
-# Call ComposePost for each case in cases.json where expect_prompt_error is not true.
-# Record: model id, date, N examples, wall time, and token usage from the API response.
-# State the cost formula if you publish a dollar amount.
-```
-
-Keep live notes separate from `go test` output. Do not treat a green test suite as an eval score.
+`go test` only checks that `BuildPrompt` wraps and caps the fixtures. Keep any later live notes out of the unit-test log; a green suite is not an eval score.
