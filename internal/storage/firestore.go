@@ -79,6 +79,41 @@ func (s *Firestore) WasDelivered(ctx context.Context, chatID int64, link string)
 	return doc.Exists(), nil
 }
 
+func (s *Firestore) pendingRef() *firestore.DocumentRef {
+	return s.client.Collection(collectionState).Doc(pendingDigestDoc)
+}
+
+func (s *Firestore) GetPendingDigest(ctx context.Context) (*PendingDigest, error) {
+	doc, err := s.pendingRef().Get(ctx)
+	if err != nil {
+		if status.Code(err) == codes.NotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var d PendingDigest
+	if err := doc.DataTo(&d); err != nil {
+		return nil, err
+	}
+	if d.Post == "" && len(d.Links) == 0 {
+		return nil, nil
+	}
+	return &d, nil
+}
+
+func (s *Firestore) SetPendingDigest(ctx context.Context, d PendingDigest) error {
+	_, err := s.pendingRef().Set(ctx, d)
+	return err
+}
+
+func (s *Firestore) ClearPendingDigest(ctx context.Context) error {
+	_, err := s.pendingRef().Delete(ctx)
+	if err != nil && status.Code(err) != codes.NotFound {
+		return err
+	}
+	return nil
+}
+
 func (s *Firestore) Close() error {
 	if s == nil || s.client == nil {
 		return nil

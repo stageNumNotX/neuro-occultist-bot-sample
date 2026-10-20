@@ -35,6 +35,24 @@ func TestLoad_pollingMinimal(t *testing.T) {
 	if _, ok := cfg.AdminUserIDs[99]; !ok {
 		t.Fatal("admin 99 missing")
 	}
+	if cfg.DigestLanguage != "Russian" {
+		t.Fatalf("default digest language=%q", cfg.DigestLanguage)
+	}
+}
+
+func TestLoad_digestLanguageAliases(t *testing.T) {
+	t.Setenv("BOT_MODE", "polling")
+	t.Setenv("TELEGRAM_TOKEN", "t")
+	t.Setenv("GEMINI_API_KEY", "g")
+	t.Setenv("DIGEST_LANGUAGE", "en")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DigestLanguage != "English" {
+		t.Fatalf("language=%q", cfg.DigestLanguage)
+	}
 }
 
 func TestLoad_webhookRequiresSecret(t *testing.T) {

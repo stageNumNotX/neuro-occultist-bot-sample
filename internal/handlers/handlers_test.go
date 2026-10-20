@@ -244,6 +244,28 @@ func TestBroadcast_failedSendDoesNotMark(t *testing.T) {
 	}
 }
 
+func TestBroadcast_stateSaveErrorIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	if err := mem.SaveChat(ctx, storage.Chat{ID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeBot{err: bot.ErrStateSave}
+	agent := service.NewAgent(mem, nil, fakeComposer{post: "post"})
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		return []rss.Item{{Title: "Go 1.23", Link: "https://example.com/go"}}, nil
+	})
+	mux := testMux(config.AppConfig{BroadcastSecret: "abc"}, fb, agent, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/broadcast", nil)
+	req.Header.Set("X-Broadcast-Secret", "abc")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d", rec.Code)
+	}
+}
+
 func TestBroadcast_emptyChats(t *testing.T) {
 	ctx := context.Background()
 	mem := storage.NewMemory()

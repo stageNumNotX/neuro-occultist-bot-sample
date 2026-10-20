@@ -48,9 +48,47 @@ type Digest struct {
 	Post  string
 }
 
-// BuildDigest fetches items not yet delivered to every saved chat and composes one post.
+// BuildDigest returns the frozen pending batch if any saved chat still lacks
+// those links. Otherwise it fetches items not yet delivered to every saved chat
+// and composes one post, then stores that batch so a later RSS item cannot
+// merge into a retry and resend already-delivered headlines.
 func (a *Agent) BuildDigest(ctx context.Context, maxItems int) (Digest, error) {
-	return a.build(ctx, maxItems, a.FetchUnsent)
+	if a.store != nil {
+		pending, err := a.store.GetPendingDigest(ctx)
+		if err != nil {
+			return Digest{}, fmt.Errorf("pending digest: %w", err)
+		}
+		if pending != nil && (pending.Post != "" || len(pending.Links) > 0) {
+			done, err := a.pendingComplete(ctx, pending.Links)
+			if err != nil {
+				return Digest{}, err
+			}
+			if !done {
+				return Digest{Texts: pending.Texts, Links: pending.Links, Post: pending.Post}, nil
+			}
+			if err := a.store.ClearPendingDigest(ctx); err != nil {
+				return Digest{}, fmt.Errorf("clear pending digest: %w", err)
+			}
+		}
+	}
+
+	d, err := a.build(ctx, maxItems, a.FetchUnsent)
+	if err != nil {
+		return Digest{}, err
+	}
+	if len(d.Links) == 0 {
+		return d, nil
+	}
+	if a.store != nil {
+		if err := a.store.SetPendingDigest(ctx, storage.PendingDigest{
+			Post:  d.Post,
+			Links: append([]string(nil), d.Links...),
+			Texts: append([]string(nil), d.Texts...),
+		}); err != nil {
+			return Digest{}, fmt.Errorf("save pending digest: %w", err)
+		}
+	}
+	return d, nil
 }
 
 // BuildLatestDigest fetches current headlines without consulting delivery state.
@@ -121,6 +159,28 @@ func (a *Agent) collect(ctx context.Context, maxItems int, skip func(string) boo
 		texts = append(texts, title+" — "+item.Link)
 	}
 	return texts, links, nil
+}
+
+func (a *Agent) pendingComplete(ctx context.Context, links []string) (bool, error) {
+	if a.store == nil {
+		return true, nil
+	}
+	if len(links) == 0 {
+		return true, nil
+	}
+	chats, err := a.store.ListChats(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list chats: %w", err)
+	}
+	if len(chats) == 0 {
+		return false, nil
+	}
+	for _, link := range links {
+		if !a.deliveredToAll(ctx, chats, link) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (a *Agent) deliveredToAll(ctx context.Context, chats []storage.Chat, link string) bool {

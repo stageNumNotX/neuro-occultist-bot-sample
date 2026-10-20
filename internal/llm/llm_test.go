@@ -132,7 +132,7 @@ func TestClient_outgoingGenerateIncludesAPIKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	c, err := newClient(ctx, "test-gemini-key", "gemini-flash", httpClient)
+	c, err := newClient(ctx, "test-gemini-key", "gemini-flash", "Russian", httpClient)
 	if err != nil {
 		t.Fatalf("newClient: %v", err)
 	}
@@ -161,8 +161,82 @@ func TestClient_outgoingGenerateIncludesAPIKey(t *testing.T) {
 	if !strings.Contains(string(gotBody), "Neuro-Occultist") {
 		t.Fatalf("system instruction text missing:\n%s", gotBody)
 	}
+	if !strings.Contains(string(gotBody), "posts in Russian") {
+		t.Fatalf("default language missing from system instruction:\n%s", gotBody)
+	}
 	if !strings.Contains(string(gotBody), "<untrusted-data>") {
 		t.Fatalf("untrusted wrapper missing from user prompt:\n%s", gotBody)
+	}
+}
+
+func TestBuildPrompt_capsItemsAndRunes(t *testing.T) {
+	items := make([]string, 0, 10)
+	for i := 0; i < 10; i++ {
+		items = append(items, "headline")
+	}
+	prompt, err := BuildPrompt(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(prompt, "- headline") != 8 {
+		t.Fatalf("expected 8 items, prompt:\n%s", prompt)
+	}
+
+	long := strings.Repeat("я", 401)
+	prompt, err = BuildPrompt([]string{long})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := between(prompt, "<untrusted-data>", "</untrusted-data>")
+	if strings.Contains(body, strings.Repeat("я", 401)) {
+		t.Fatal("item longer than 400 runes was not truncated")
+	}
+}
+
+func TestSystemInstructions_language(t *testing.T) {
+	ru := SystemInstructions("")
+	if !strings.Contains(ru, "posts in Russian") {
+		t.Fatalf("default: %s", ru)
+	}
+	en := SystemInstructions("English")
+	if !strings.Contains(en, "posts in English") || !strings.Contains(en, "sentences in English") {
+		t.Fatalf("english: %s", en)
+	}
+	if strings.Contains(en, "posts in Russian") {
+		t.Fatal("English instructions still mention Russian")
+	}
+}
+
+func TestComposePost_emptyCandidates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "generateContent") {
+			_, _ = w.Write([]byte(`{"candidates":[{"content":{"parts":[],"role":"model"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	dest, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpClient := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &hostRewrite{dest: dest, next: http.DefaultTransport},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := newClient(ctx, "test-gemini-key", "gemini-flash", "English", httpClient)
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.ComposePost(ctx, []string{"Go 1.23 released"})
+	if err == nil || !strings.Contains(err.Error(), "empty response") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

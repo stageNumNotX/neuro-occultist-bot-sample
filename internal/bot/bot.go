@@ -30,8 +30,11 @@ var (
 	ErrNoChats = errors.New("no chats to broadcast to")
 	// ErrAllFailed means every attempted send was rejected by Telegram.
 	ErrAllFailed = errors.New("broadcast failed for all chats")
-	// ErrPartial means at least one chat received the post and at least one did not.
+	// ErrPartial means Telegram accepted the post for some chats and rejected it for others.
 	ErrPartial = errors.New("broadcast delivered to some chats only")
+	// ErrStateSave means Telegram accepted one or more messages but delivery
+	// state was not fully persisted. The next run may send those chats again.
+	ErrStateSave = errors.New("broadcast sent but delivery state was not fully saved")
 )
 
 // Options wires Telegram, storage, the RSS/LLM pipeline, and optional images.
@@ -336,7 +339,7 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 		return ErrNoChats
 	}
 
-	var delivered, failed, skipped int
+	var sent, saved, unsaved, failed, skipped int
 	var firstErr error
 	for _, ch := range chats {
 		if err := ctx.Err(); err != nil {
@@ -358,15 +361,27 @@ func (b *Bot) Broadcast(ctx context.Context, post string, img []byte, links []st
 			}
 			continue
 		}
-		b.markChat(ctx, ch.ID, links)
-		delivered++
+		sent++
+		if err := b.markChat(ctx, ch.ID, links); err != nil {
+			log.Printf("delivery state not fully saved chat=%d: %v", ch.ID, err)
+			unsaved++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		saved++
 	}
 
 	switch {
-	case delivered == 0 && failed > 0 && skipped == 0:
+	case sent == 0 && failed > 0 && skipped == 0:
 		return fmt.Errorf("%w: %v", ErrAllFailed, firstErr)
+	case failed > 0 && unsaved > 0:
+		return fmt.Errorf("%w: %w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d: %v", ErrPartial, ErrStateSave, sent, saved, unsaved, failed, skipped, firstErr)
 	case failed > 0:
-		return fmt.Errorf("%w: delivered=%d failed=%d skipped=%d", ErrPartial, delivered, failed, skipped)
+		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d failed=%d skipped=%d", ErrPartial, sent, saved, unsaved, failed, skipped)
+	case unsaved > 0:
+		return fmt.Errorf("%w: sent=%d saved=%d unsaved=%d skipped=%d: %v", ErrStateSave, sent, saved, unsaved, skipped, firstErr)
 	default:
 		return nil
 	}
@@ -385,12 +400,20 @@ func (b *Bot) chatHasAll(ctx context.Context, chatID int64, links []string) bool
 	return true
 }
 
-func (b *Bot) markChat(ctx context.Context, chatID int64, links []string) {
+// markChat writes delivery records for every link. It keeps going after a
+// failure so a multi-link batch can be partially saved, and returns the first
+// MarkDelivered error. Telegram acceptance is tracked separately by Broadcast.
+func (b *Bot) markChat(ctx context.Context, chatID int64, links []string) error {
+	var firstErr error
 	for _, link := range links {
 		if err := b.store.MarkDelivered(ctx, chatID, link); err != nil {
-			log.Printf("mark delivered chat=%d: %v", chatID, err)
+			log.Printf("mark delivered chat=%d link=%s: %v", chatID, link, err)
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
+	return firstErr
 }
 
 func (b *Bot) sendOne(chat *tb.Chat, post string, img []byte) error {

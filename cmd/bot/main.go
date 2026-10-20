@@ -26,7 +26,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	llmClient, err := llm.New(ctx, cfg.GeminiAPIKey, cfg.GeminiModel)
+	llmClient, err := llm.New(ctx, cfg.GeminiAPIKey, cfg.GeminiModel, cfg.DigestLanguage)
 	if err != nil {
 		log.Fatalf("llm: %v", err)
 	}

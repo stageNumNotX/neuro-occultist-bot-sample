@@ -38,3 +38,35 @@ func TestMemory_chatsAndDeliveries(t *testing.T) {
 		t.Fatalf("chat 2 should be independent, was=%v err=%v", was, err)
 	}
 }
+
+func TestMemory_pendingDigest(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+
+	got, err := m.GetPendingDigest(ctx)
+	if err != nil || got != nil {
+		t.Fatalf("empty pending got=%v err=%v", got, err)
+	}
+
+	in := PendingDigest{Post: "p", Links: []string{"https://example.com/x"}, Texts: []string{"X — https://example.com/x"}}
+	if err := m.SetPendingDigest(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	got, err = m.GetPendingDigest(ctx)
+	if err != nil || got == nil || got.Post != "p" || len(got.Links) != 1 {
+		t.Fatalf("got=%v err=%v", got, err)
+	}
+	got.Links[0] = "mutated"
+	got2, err := m.GetPendingDigest(ctx)
+	if err != nil || got2.Links[0] != "https://example.com/x" {
+		t.Fatalf("pending slice must be copied, got=%v err=%v", got2, err)
+	}
+
+	if err := m.ClearPendingDigest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err = m.GetPendingDigest(ctx)
+	if err != nil || got != nil {
+		t.Fatalf("cleared pending got=%v err=%v", got, err)
+	}
+}

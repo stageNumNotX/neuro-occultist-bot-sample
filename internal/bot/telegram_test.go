@@ -41,6 +41,7 @@ type recordedSend struct {
 	Method string
 	ChatID string
 	Text   string
+	OK     bool
 }
 
 type telegramAPI struct {
@@ -59,7 +60,7 @@ func (a *telegramAPI) roundTrip(req *http.Request) (*http.Response, error) {
 	n := a.n
 	fail := a.failFor[chatID] || a.failNth[n]
 	if method == "sendMessage" || method == "sendPhoto" {
-		a.sends = append(a.sends, recordedSend{Method: method, ChatID: chatID, Text: text})
+		a.sends = append(a.sends, recordedSend{Method: method, ChatID: chatID, Text: text, OK: !fail})
 	}
 	a.mu.Unlock()
 
@@ -332,6 +333,197 @@ func TestStop_withoutStartReturns(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop hung on a bot that never started polling")
 	}
+}
+
+type markHookStore struct {
+	storage.Store
+	failLink string
+	failChat int64
+	failN    int
+	n        int
+}
+
+func (s *markHookStore) MarkDelivered(ctx context.Context, chatID int64, link string) error {
+	s.n++
+	if s.failChat != 0 && chatID == s.failChat {
+		return errors.New("mark failed")
+	}
+	if s.failLink != "" && link == s.failLink {
+		return errors.New("mark failed")
+	}
+	if s.failN > 0 && s.n == s.failN {
+		return errors.New("mark failed")
+	}
+	return s.Store.MarkDelivered(ctx, chatID, link)
+}
+
+func TestBroadcast_markFailureIsNotSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	store := &markHookStore{Store: mem, failN: 1}
+	api := &telegramAPI{}
+	b := testBot(t, store, nil, fakeImages{}, api, false)
+
+	err := b.Broadcast(ctx, "hello", nil, []string{"https://example.com/a"})
+	if !errors.Is(err, ErrStateSave) {
+		t.Fatalf("err=%v", err)
+	}
+	if n := len(api.snapshot()); n != 1 {
+		t.Fatalf("telegram must have accepted the send, sends=%d", n)
+	}
+	was, _ := mem.WasDelivered(ctx, 1, "https://example.com/a")
+	if was {
+		t.Fatal("failed MarkDelivered must not be treated as saved")
+	}
+}
+
+func TestBroadcast_partialLinkSetSave(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1)
+	links := []string{"https://example.com/a", "https://example.com/b"}
+	store := &markHookStore{Store: mem, failLink: links[1]}
+	api := &telegramAPI{}
+	b := testBot(t, store, nil, fakeImages{}, api, false)
+
+	err := b.Broadcast(ctx, "hello", nil, links)
+	if !errors.Is(err, ErrStateSave) {
+		t.Fatalf("err=%v", err)
+	}
+	wasA, _ := mem.WasDelivered(ctx, 1, links[0])
+	wasB, _ := mem.WasDelivered(ctx, 1, links[1])
+	if !wasA || wasB {
+		t.Fatalf("expected partial save wasA=%v wasB=%v", wasA, wasB)
+	}
+	if b.chatHasAll(ctx, 1, links) {
+		t.Fatal("partially saved link set must not count as fully delivered")
+	}
+}
+
+func TestBroadcast_mixedSendAndSaveErrors(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+	store := &markHookStore{Store: mem, failChat: 1}
+	api := &telegramAPI{failFor: map[string]bool{"2": true}}
+	b := testBot(t, store, nil, fakeImages{}, api, false)
+
+	err := b.Broadcast(ctx, "hello", nil, []string{"https://example.com/a"})
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrStateSave) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestBroadcast_rssChangeDoesNotResendToSuccess(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	saveChats(t, mem, 1, 2)
+
+	items := []rss.Item{{Title: "Story X", Link: "https://example.com/x"}}
+	fc := &scriptedComposer{posts: []string{"DIGEST-X", "DIGEST-Y"}}
+	agent := service.NewAgent(mem, nil, fc)
+	agent.WithRSSFetch(func(_ context.Context, _ []string, _ time.Duration, _ int) ([]rss.Item, error) {
+		out := make([]rss.Item, len(items))
+		copy(out, items)
+		return out, nil
+	})
+
+	api := &telegramAPI{failFor: map[string]bool{"2": true}}
+	b := testBot(t, mem, agent, fakeImages{}, api, false)
+
+	d1, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1.Post != "DIGEST-X" {
+		t.Fatalf("first post=%q", d1.Post)
+	}
+	err = b.Broadcast(ctx, d1.Post, nil, d1.Links)
+	if !errors.Is(err, ErrPartial) {
+		t.Fatalf("first broadcast err=%v", err)
+	}
+
+	items = []rss.Item{
+		{Title: "Story X", Link: "https://example.com/x"},
+		{Title: "Story Y", Link: "https://example.com/y"},
+	}
+	api.failFor = nil
+
+	d2, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d2.Post != "DIGEST-X" {
+		t.Fatalf("retry post must stay frozen, got %q", d2.Post)
+	}
+	if err := b.Broadcast(ctx, d2.Post, nil, d2.Links); err != nil {
+		t.Fatalf("retry broadcast: %v", err)
+	}
+
+	accepted := func() (toA, toB []string) {
+		for _, s := range api.snapshot() {
+			if !s.OK {
+				continue
+			}
+			switch s.ChatID {
+			case "1":
+				toA = append(toA, s.Text)
+			case "2":
+				toB = append(toB, s.Text)
+			}
+		}
+		return toA, toB
+	}
+
+	toA, toB := accepted()
+	if len(toA) != 1 || toA[0] != "DIGEST-X" {
+		t.Fatalf("chat A accepted messages=%v", toA)
+	}
+	if len(toB) != 1 || toB[0] != "DIGEST-X" {
+		t.Fatalf("chat B accepted messages=%v", toB)
+	}
+
+	d3, err := agent.BuildDigest(ctx, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d3.Post != "DIGEST-Y" {
+		t.Fatalf("new batch post=%q", d3.Post)
+	}
+	if err := b.Broadcast(ctx, d3.Post, nil, d3.Links); err != nil {
+		t.Fatal(err)
+	}
+	toA, toB = accepted()
+	if len(toA) != 2 || toA[0] != "DIGEST-X" || toA[1] != "DIGEST-Y" {
+		t.Fatalf("chat A content=%v", toA)
+	}
+	if len(toB) != 2 || toB[0] != "DIGEST-X" || toB[1] != "DIGEST-Y" {
+		t.Fatalf("chat B content=%v", toB)
+	}
+	xCount := 0
+	for _, text := range toA {
+		if text == "DIGEST-X" {
+			xCount++
+		}
+	}
+	if xCount != 1 {
+		t.Fatalf("chat A must not receive X again after Y appeared, messages=%v", toA)
+	}
+}
+
+type scriptedComposer struct {
+	posts []string
+	n     int
+}
+
+func (s *scriptedComposer) ComposePost(_ context.Context, _ []string) (string, error) {
+	if s.n >= len(s.posts) {
+		return "", errors.New("unexpected extra compose")
+	}
+	post := s.posts[s.n]
+	s.n++
+	return post, nil
 }
 
 func TestBroadcast_sendUsesTelegramHTTP(t *testing.T) {
