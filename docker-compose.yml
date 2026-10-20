@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      BOT_MODE: polling
+      PORT: "8080"
+    ports:
+      - "8080:8080"

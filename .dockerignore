@@ -1,0 +1,14 @@
+.git
+.github
+**/.DS_Store
+**/*.log
+**/bin
+**/dist
+**/build
+**/tmp
+**/vendor
+bot
+.env
+.env.local
+README.md
+*.md

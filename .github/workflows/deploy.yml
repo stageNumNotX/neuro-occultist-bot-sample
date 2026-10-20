@@ -1,0 +1,81 @@
+name: Deploy to Cloud Run
+
+on:
+  workflow_dispatch: {}
+
+env:
+  REGION: ${{ secrets.GCP_REGION }}
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  SERVICE_NAME: ${{ secrets.CLOUD_RUN_SERVICE }}
+  IMAGE_NAME: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/docker/neuro-occultist-bot
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      RSS_FEEDS: ${{ secrets.RSS_FEEDS }}
+      BROADCAST_SECRET: ${{ secrets.BROADCAST_SECRET }}
+      VERTEX_LOCATION: ${{ secrets.VERTEX_LOCATION }}
+      VERTEX_IMAGE_MODEL: ${{ secrets.VERTEX_IMAGE_MODEL }}
+      VERTEX_ASPECT_RATIO: ${{ secrets.VERTEX_ASPECT_RATIO }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          platforms: linux/amd64
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          flags: "--port=8080 --max-instances=3 --cpu=1 --memory=512Mi --allow-unauthenticated --timeout=300 --concurrency=80 --min-instances=0"
+          env_vars: |
+            BOT_MODE=webhook
+            TELEGRAM_TOKEN=${{ env.TELEGRAM_TOKEN }}
+            GEMINI_API_KEY=${{ env.GEMINI_API_KEY }}
+            FIRESTORE_PROJECT_ID=${{ env.PROJECT_ID }}
+            WEBHOOK_SECRET=${{ env.WEBHOOK_SECRET }}
+            BROADCAST_SECRET=${{ env.BROADCAST_SECRET }}
+            RSS_FEEDS=${{ env.RSS_FEEDS }}
+            VERTEX_PROJECT_ID=${{ env.PROJECT_ID }}
+            VERTEX_LOCATION=${{ env.VERTEX_LOCATION }}
+            VERTEX_IMAGE_MODEL=${{ env.VERTEX_IMAGE_MODEL }}
+            VERTEX_ASPECT_RATIO=${{ env.VERTEX_ASPECT_RATIO }}
+
+      - name: Set Telegram webhook
+        if: ${{ env.TELEGRAM_TOKEN != '' && env.WEBHOOK_SECRET != '' }}
+        env:
+          TELEGRAM_TOKEN: ${{ env.TELEGRAM_TOKEN }}
+          WEBHOOK_SECRET: ${{ env.WEBHOOK_SECRET }}
+          SERVICE_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook" \
+            --data-urlencode "url=${SERVICE_URL}/webhook" \
+            --data-urlencode "secret_token=${WEBHOOK_SECRET}"

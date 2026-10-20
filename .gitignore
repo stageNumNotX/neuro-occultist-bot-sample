@@ -1,0 +1,24 @@
+# local env (never commit secrets)
+.env
+.env.local
+*.pem
+*.p12
+*-credentials.json
+service-account*.json
+
+# binaries / build
+/bot
+/bin
+/dist
+/build
+*.exe
+*.test
+*.out
+coverage.txt
+
+# logs / OS
+*.log
+.DS_Store
+
+# go
+/vendor
